@@ -7328,6 +7328,7 @@ def _build_call_kwargs(
                 _seen.add(_tname)
             _deduped.append(_t)
         kwargs["tools"] = _deduped
+        kwargs.setdefault("tool_choice", "auto")
 
     # Build provider-aware reasoning kwargs through the same profile hooks used
     # by the standard chat-completions transport. Some providers require

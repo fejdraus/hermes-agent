@@ -1,0 +1,5 @@
+name: brain
+version: 0.1.0
+description: "Brain graph memory — typed SPO knowledge graph (subject-predicate-object) over Postgres/pgvector, with forced auto-recall and LLM triple auto-store."
+hooks:
+  - on_turn_start

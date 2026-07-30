@@ -2234,6 +2234,42 @@ def _run_job_script(
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
 
+    # Inline shell shortcut (LOCAL PATCH — not upstream).
+    # Some LLMs (kilocode-auto-router, agents ported from nanobot) ignore
+    # the "script = filename under ~/.hermes/scripts/" contract and pass a
+    # shell one-liner directly. Rather than fail, run it via bash. A bare
+    # filename has no spaces or shell metachars; anything else is treated
+    # as inline shell and executed with scripts_dir as cwd.
+    _s = script_path.strip()
+    _shell_metachars = (chr(34), chr(39), "|", ">", "<", "&", "`")
+    _shell_starts = ("echo ", "printf ", "cat ", "curl ", "python -c", "bash -c")
+    _looks_inline = (
+        " " in _s
+        or any(_s.startswith(w) for w in _shell_starts)
+        or any(c in _s for c in _shell_metachars)
+    )
+    if _looks_inline:
+        script_timeout = _get_script_timeout()
+        _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+        if _bash is None:
+            return False, "Inline shell script requested but bash not found on PATH."
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+            popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+            _env = _sanitize_subprocess_env(os.environ.copy())
+            result = subprocess.run(
+                [_bash, "-c", _s],
+                capture_output=True, text=True, timeout=script_timeout,
+                cwd=str(scripts_dir), env=_env,
+                **popen_kwargs,
+            )
+            output = (result.stdout or "") + (result.stderr if result.returncode else "")
+            return (result.returncode == 0, output)
+        except subprocess.TimeoutExpired:
+            return False, f"Inline shell command timed out after {script_timeout}s"
+        except Exception as e:
+            return False, f"Inline shell command failed: {type(e).__name__}: {e}"
+
     raw = Path(script_path).expanduser()
     if raw.is_absolute():
         path = raw.resolve()

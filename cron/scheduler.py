@@ -2254,9 +2254,9 @@ def _run_job_script(
         if _bash is None:
             return False, "Inline shell script requested but bash not found on PATH."
         try:
-            from tools.environments.local import _sanitize_subprocess_env
+            from tools.environments.local import build_subprocess_env
             popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
-            _env = _sanitize_subprocess_env(os.environ.copy())
+            _env = build_subprocess_env()
             result = subprocess.run(
                 [_bash, "-c", _s],
                 capture_output=True, text=True, timeout=script_timeout,

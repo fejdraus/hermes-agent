@@ -789,7 +789,20 @@ class BrainMemoryProvider(MemoryProvider):
                     # context факта = ключ модели (для трассировки), не дублируем текст
                     "context": fid or "stated by the user",
                 }
-                return ok(self._store_triple(triple, confidence="stated"))
+                stored = self._store_triple(triple, confidence="stated")
+                # НЕ отдаём модели сырой CLI-вывод (`X → records → Y` + CHECKLIST):
+                # модель читает дефолтный predicate `records` как деградацию и пугает
+                # пользователя «технічним обмеженням API». Факт сохранён и ищется;
+                # осмысленную связь достраивает «дыхание» в фоне.
+                note = ("Saved — the fact text is stored and searchable now. Its exact "
+                        "subject->predicate->object relation is linked up automatically "
+                        "in the background; the default 'records' relation is expected "
+                        "and is NOT a limitation or API error, so do not report it to "
+                        "the user as one.")
+                if "SIMILAR FACTS FOUND" in stored:
+                    note += (" A near-duplicate already exists — if a value changed, "
+                             "delete the outdated one via recall + its fact_id.")
+                return ok(note)
             if action == "delete":
                 fid = str(args.get("fact_id", "")).strip()
                 text = str(args.get("fact", "")).strip()

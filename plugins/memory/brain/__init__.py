@@ -206,6 +206,34 @@ _BREATH_TURNS = 10        # выдох по числу ходов
 _BREATH_SECONDS = 7200    # ...или по времени (2 часа)
 _PERIOD_CHARS = 20000     # верхний предел периода в символах (MiniMax-M3 держит)
 
+_RECONCILE_PROMPT = """You reconcile newly-extracted memory facts against what is ALREADY stored.
+
+EXISTING FACTS (id: text):
+{existing}
+
+NEW FACTS (index: text):
+{new}
+
+For EACH new fact choose one action:
+- "skip": an existing fact already states the same thing (same subject AND same value).
+- "update": this new fact is the SAME evolving datum as an existing fact but its value
+  CHANGED — a running count / remaining quantity / current status of the SAME subject that
+  moved (e.g. "6 eggs remaining" -> "5 eggs remaining"; "weighs 83.4" -> "weighs 83.0").
+  Give the existing fact's id in "id".
+- "add": genuinely new information not covered by any existing fact.
+
+HARD RULES:
+- "update" ONLY when it is the same subject/topic and the value moved. NEVER merge different
+  subjects, different items, or different events.
+- Historical events (ate X on a date, bought X, cooked X, a dated log entry) are ALWAYS "add"
+  — a new day's event never supersedes another day's event.
+- Rules, preferences, plan structure → "add" unless byte-for-byte already present ("skip").
+- When unsure, choose "add". Never guess an id.
+
+Return ONLY a JSON array, one object per new fact:
+[{"i": <index>, "action": "skip|update|add", "id": "<existing id if update, else empty>"}]"""
+
+
 _CONSOLIDATE_PROMPT = """You consolidate a PERIOD of conversation into long-term graph memory.
 
 Return ONLY a JSON array. Each item:
@@ -577,8 +605,7 @@ class BrainMemoryProvider(MemoryProvider):
                             t.get("subject"), missing)
                 continue
             kept.append(t)
-        for t in kept:
-            self._store_triple(t)
+        self._store_with_reconcile(kept)
         logger.info("brain breathe: %d turn(s) -> %d fact(s)", len(turns), len(kept))
         # success — clear only the turns we consumed (append-safe: rewrite remainder)
         with self._breath_lock:
@@ -609,6 +636,96 @@ class BrainMemoryProvider(MemoryProvider):
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"]
         return self._parse_triples(text)
+
+    # -- reconcile (шаг 2) ---------------------------------------------------
+
+    def _recall_candidates(self, query: str) -> List[tuple]:
+        """Существующие факты, похожие на query: [(fact_id8, content), ...].
+        Парсим вывод recall (строка `[id] [sim] s → p → o` + строка содержимого)."""
+        if not query.strip():
+            return []
+        try:
+            out = self._run_cli(["recall", query], _RECALL_TIMEOUT)
+        except Exception:
+            return []
+        res = []
+        for m in re.finditer(r"\[([0-9a-f]{8})\]\s*\[[\d.]+\][^\n]*\n\s*(?:📝\s*)?([^\n]+)", out):
+            res.append((m.group(1), m.group(2).strip()))
+        return res[:5]
+
+    def _reconcile_llm(self, existing_text: str, new_text: str) -> List[Dict[str, Any]]:
+        import httpx
+        prompt = _RECONCILE_PROMPT.replace("{existing}", existing_text).replace("{new}", new_text)
+        payload = {
+            "model": self._extract_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "stream": False,
+        }
+        with httpx.Client(timeout=_EXTRACT_TIMEOUT) as client:
+            r = client.post(
+                self._llm_base_url.rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {self._llm_api_key}"},
+                json=payload,
+            )
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
+        cleaned = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.MULTILINE).strip()
+        m = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return []
+        return [d for d in data if isinstance(d, dict)]
+
+    def _store_with_reconcile(self, triples: List[Dict[str, str]]) -> None:
+        """Перед записью сверить каждый факт с существующими: тот же предмет с
+        изменившимся значением → update на месте (не delete), совпал → skip, новый →
+        add. Семантику решает LLM (та же, что консолидация), в фоне вне крит-пути.
+        При любой осечке — безопасный фолбэк: просто store всех (как раньше)."""
+        if not triples:
+            return
+        existing: Dict[str, str] = {}
+        for t in triples:
+            probe = str(t.get("fact", "")).strip() or \
+                f"{t.get('subject','')} {t.get('predicate','')} {t.get('object','')}"
+            for fid, content in self._recall_candidates(probe):
+                existing.setdefault(fid, content)
+        if not existing:
+            for t in triples:
+                self._store_triple(t)
+            return
+        ex_items = list(existing.items())[:20]
+        ex_text = "\n".join(f"{fid}: {c}" for fid, c in ex_items)
+        new_text = "\n".join(f"{i}: {t.get('fact', '')}" for i, t in enumerate(triples))
+        try:
+            actions = self._reconcile_llm(ex_text, new_text)
+        except Exception as e:
+            logger.warning("brain reconcile: LLM failed, storing all as add: %s", e)
+            for t in triples:
+                self._store_triple(t)
+            return
+        by_i = {a.get("i"): a for a in actions if isinstance(a.get("i"), int)}
+        known_ids = {fid for fid, _ in ex_items}
+        for i, t in enumerate(triples):
+            a = by_i.get(i, {})
+            act = str(a.get("action", "add")).strip().lower()
+            fid = str(a.get("id", "")).strip()
+            new_fact = str(t.get("fact", "")).strip() or \
+                f"{t.get('subject','')} {t.get('predicate','')} {t.get('object','')}"
+            if act == "skip":
+                logger.info("brain reconcile: skip %r (already known)", t.get("subject"))
+                continue
+            if act == "update" and fid and fid in known_ids:
+                try:
+                    self._run_cli(["update", "--id", fid, "--content", new_fact, "-y"], _STORE_TIMEOUT)
+                    logger.info("brain reconcile: UPDATE %s <- %r", fid, t.get("subject"))
+                    continue
+                except Exception as e:
+                    logger.warning("brain reconcile: update %s failed (%s), falling back to add", fid, e)
+            self._store_triple(t)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # Exhale whatever is buffered when the session closes.

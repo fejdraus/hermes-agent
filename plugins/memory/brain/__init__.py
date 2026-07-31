@@ -99,8 +99,8 @@ BRAIN_GRAPH_SCHEMA: Dict[str, Any] = {
         "• communities — thematic clusters of entities\n"
         "• entity — all facts about one entity\n"
         "• store — add a relation: subject/predicate/object are canonical English, "
-        "fact/context free-form. If you can't split it, just pass the whole "
-        "sentence in `fact` and it is decomposed for you.\n"
+        "fact/context free-form. If you can't split it, just pass the sentence in "
+        "`fact` — it is captured immediately and linked up in the background.\n"
         "• search — plain semantic search over facts\n"
         "• delete — remove a WRONG fact. Pass `fact_id`, or `fact` with the EXACT "
         "stored sentence. A non-exact `fact` is refused and the tool lists candidate "
@@ -750,38 +750,38 @@ class BrainMemoryProvider(MemoryProvider):
                         "context": str(args.get("context", "")).strip() or "stated by the user",
                     }
                     return ok(self._store_triple(triple, confidence="stated"))
-                # СТРАХОВКА (guard-in-code): модель через раз зовёт store ПЛОСКО —
-                # без триплета, кладя факт в fact/content/context (стиль файлового
-                # memory-tool), напр. {"action":"store","context":"31.07 сніданок ..."}.
-                # Раньше это мгновенно отбивалось "Need subject/predicate/object", факт
-                # молча утекал в MEMORY.md. Теперь берём свободный текст и раскладываем
-                # его тем же LLM-экстрактором, что и «дыхание» — модель шлёт как умеет,
-                # код доводит до триплета.
-                free = ""
-                for k in ("fact", "context", "content"):
-                    v = str(args.get(k, "")).strip()
-                    if " " in v and len(v) > len(free):  # предпочесть текст-предложение слагу
-                        free = v
-                if not free:
-                    for k in ("fact", "context", "content"):
-                        v = str(args.get(k, "")).strip()
-                        if v:
-                            free = v
-                            break
-                if not free:
-                    return json.dumps({"error": "Need 'subject'/'predicate'/'object', "
-                                       "or a free-text 'fact' sentence to decompose"})
-                try:
-                    triples = self._extract_triples(free, "")
-                except Exception as e:
-                    return json.dumps({"error": f"store decompose failed: {e}"},
-                                      ensure_ascii=False)
-                if not triples:
-                    return json.dumps({"error": "could not extract subject/predicate/"
-                                       "object from the text — pass them explicitly"},
-                                      ensure_ascii=False)
-                results = [self._store_triple(t, confidence="stated") for t in triples]
-                return ok(" ; ".join(r for r in results if r)[:400])
+                # СТРАХОВКА (guard-in-code): модель через раз зовёт store ПЛОСКО, как
+                # файловый memory-tool — кладёт факт в `content`/`fact`, ключ в `fact_id`,
+                # мета в `context`, а predicate/object не даёт. Раньше это отбивалось
+                # "Need subject/predicate/object" и факт утекал в MEMORY.md.
+                #
+                # НЕ зовём LLM здесь: синхронный декомпозер конкурировал с основным ходом
+                # на одном MiniMax и таймаутил 60с × ~10 store/ход. Пишем факт МГНОВЕННО и
+                # детерминированно (запись памяти не должна зависеть от флаки-эндпоинта).
+                # Осмысленные связи из того же разговора достраивает «дыхание» в фоне —
+                # ему LLM доступен вне критического пути.
+                #
+                # `context` у модели — мета-приписка ("stated by user ...", "test"), не
+                # факт: берём текст только из fact/content, context — в поле context.
+                free = max((str(args.get(k, "")).strip() for k in ("fact", "content")),
+                           key=len, default="")
+                fid = str(args.get("fact_id", "")).strip()
+                if not (free or subj or fid):
+                    return json.dumps({"error": "Need at least a 'subject'/'fact_id' "
+                                       "or a 'fact'/'content' sentence"})
+                subj = subj or _slugify(fid) or _slugify(free)
+                pred = pred or "records"
+                # object обязан отличаться от subject (self-loop пропускается): слаг факта,
+                # иначе слаг ключа.
+                obj = obj or _slugify(free) or _slugify(fid) or "note"
+                if obj == subj:
+                    obj = _slugify(fid) if _slugify(fid) != subj else "note"
+                triple = {
+                    "subject": subj, "predicate": pred, "object": obj,
+                    "fact": free or f"{subj} {pred} {obj}",
+                    "context": str(args.get("context", "")).strip() or "stated by the user",
+                }
+                return ok(self._store_triple(triple, confidence="stated"))
             if action == "delete":
                 fid = str(args.get("fact_id", "")).strip()
                 text = str(args.get("fact", "")).strip()

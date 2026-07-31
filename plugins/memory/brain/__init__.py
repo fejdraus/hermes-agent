@@ -761,14 +761,21 @@ class BrainMemoryProvider(MemoryProvider):
                 # Осмысленные связи из того же разговора достраивает «дыхание» в фоне —
                 # ему LLM доступен вне критического пути.
                 #
-                # `context` у модели — мета-приписка ("stated by user ...", "test"), не
-                # факт: берём текст только из fact/content, context — в поле context.
-                free = max((str(args.get(k, "")).strip() for k in ("fact", "content")),
+                # ВАЖНО: эта модель кладёт сам ФАКТ в `context` (как файловый memory-tool
+                # кладёт содержимое в `content`), а `fact_id` использует как ключ. Напр.
+                # {"context":"31.07 сніданок: 250 г гречки...","fact_id":"meal-1-..."}.
+                # Поэтому текст факта берём из ЛЮБОГО из fact/content/context (самый длинный),
+                # иначе получались заглушки "subject records item" без содержания.
+                free = max((str(args.get(k, "")).strip()
+                            for k in ("fact", "content", "context")),
                            key=len, default="")
                 fid = str(args.get("fact_id", "")).strip()
                 if not (free or subj or fid):
                     return json.dumps({"error": "Need at least a 'subject'/'fact_id' "
-                                       "or a 'fact'/'content' sentence"})
+                                       "or a 'fact'/'content'/'context' text"})
+                # если текста нет вовсе — хоть де-слагнутый ключ, чтобы факт был находим
+                if not free:
+                    free = (fid or subj).replace("-", " ").replace("_", " ").strip()
                 subj = subj or _slugify(fid) or _slugify(free)
                 pred = pred or "records"
                 # object обязан отличаться от subject (self-loop пропускается): слаг факта,
@@ -778,8 +785,9 @@ class BrainMemoryProvider(MemoryProvider):
                     obj = _slugify(fid) if _slugify(fid) != subj else "note"
                 triple = {
                     "subject": subj, "predicate": pred, "object": obj,
-                    "fact": free or f"{subj} {pred} {obj}",
-                    "context": str(args.get("context", "")).strip() or "stated by the user",
+                    "fact": free,
+                    # context факта = ключ модели (для трассировки), не дублируем текст
+                    "context": fid or "stated by the user",
                 }
                 return ok(self._store_triple(triple, confidence="stated"))
             if action == "delete":

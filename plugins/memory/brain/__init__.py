@@ -99,7 +99,8 @@ BRAIN_GRAPH_SCHEMA: Dict[str, Any] = {
         "• communities — thematic clusters of entities\n"
         "• entity — all facts about one entity\n"
         "• store — add a relation: subject/predicate/object are canonical English, "
-        "fact/context free-form\n"
+        "fact/context free-form. If you can't split it, just pass the whole "
+        "sentence in `fact` and it is decomposed for you.\n"
         "• search — plain semantic search over facts\n"
         "• delete — remove a WRONG fact. Pass `fact_id`, or `fact` with the EXACT "
         "stored sentence. A non-exact `fact` is refused and the tool lists candidate "
@@ -742,14 +743,45 @@ class BrainMemoryProvider(MemoryProvider):
             if action == "store":
                 subj, pred, obj = (str(args.get(k, "")).strip()
                                    for k in ("subject", "predicate", "object"))
-                if not (subj and pred and obj):
-                    return json.dumps({"error": "Need 'subject', 'predicate', 'object'"})
-                triple = {
-                    "subject": subj, "predicate": pred, "object": obj,
-                    "fact": str(args.get("fact", "")).strip() or f"{subj} {pred} {obj}",
-                    "context": str(args.get("context", "")).strip() or "stated by the user",
-                }
-                return ok(self._store_triple(triple, confidence="stated"))
+                if subj and pred and obj:
+                    triple = {
+                        "subject": subj, "predicate": pred, "object": obj,
+                        "fact": str(args.get("fact", "")).strip() or f"{subj} {pred} {obj}",
+                        "context": str(args.get("context", "")).strip() or "stated by the user",
+                    }
+                    return ok(self._store_triple(triple, confidence="stated"))
+                # СТРАХОВКА (guard-in-code): модель через раз зовёт store ПЛОСКО —
+                # без триплета, кладя факт в fact/content/context (стиль файлового
+                # memory-tool), напр. {"action":"store","context":"31.07 сніданок ..."}.
+                # Раньше это мгновенно отбивалось "Need subject/predicate/object", факт
+                # молча утекал в MEMORY.md. Теперь берём свободный текст и раскладываем
+                # его тем же LLM-экстрактором, что и «дыхание» — модель шлёт как умеет,
+                # код доводит до триплета.
+                free = ""
+                for k in ("fact", "context", "content"):
+                    v = str(args.get(k, "")).strip()
+                    if " " in v and len(v) > len(free):  # предпочесть текст-предложение слагу
+                        free = v
+                if not free:
+                    for k in ("fact", "context", "content"):
+                        v = str(args.get(k, "")).strip()
+                        if v:
+                            free = v
+                            break
+                if not free:
+                    return json.dumps({"error": "Need 'subject'/'predicate'/'object', "
+                                       "or a free-text 'fact' sentence to decompose"})
+                try:
+                    triples = self._extract_triples(free, "")
+                except Exception as e:
+                    return json.dumps({"error": f"store decompose failed: {e}"},
+                                      ensure_ascii=False)
+                if not triples:
+                    return json.dumps({"error": "could not extract subject/predicate/"
+                                       "object from the text — pass them explicitly"},
+                                      ensure_ascii=False)
+                results = [self._store_triple(t, confidence="stated") for t in triples]
+                return ok(" ; ".join(r for r in results if r)[:400])
             if action == "delete":
                 fid = str(args.get("fact_id", "")).strip()
                 text = str(args.get("fact", "")).strip()

@@ -1917,6 +1917,22 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     # Detect endpoint from URL
     is_t2a_v2 = "t2a_v2" in base_url
 
+    # Fork: keep MiniMax in one language for Cyrillic text (kills ru/en
+    # code-switching on symbols) and add sentence pauses for prosody.
+    language_boost = str(mm_config.get("language_boost") or "").strip()
+    if not language_boost:
+        try:
+            from tools.tts_ru_normalize import detect_speech_language as _dsl
+            language_boost = {"ru": "Russian", "uk": "Ukrainian"}.get(_dsl(text) or "", "")
+        except Exception:
+            language_boost = ""
+    try:
+        _pause = float(mm_config.get("sentence_pause", 0.3) or 0)
+    except (TypeError, ValueError):
+        _pause = 0.0
+    if is_t2a_v2 and _pause > 0:
+        text = re.sub(r"([.!?])\s+", lambda m: m.group(1) + ("<#%.2f#> " % _pause), text)
+
     if is_t2a_v2:
         # t2a_v2 endpoint: nested voice_setting/audio_setting structure
         payload = {
@@ -1936,6 +1952,8 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
                 "channel": 1,
             },
         }
+        if language_boost:
+            payload["language_boost"] = language_boost
     else:
         # text_to_speech endpoint: flat payload
         payload = {

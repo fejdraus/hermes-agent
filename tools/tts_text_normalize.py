@@ -13,6 +13,11 @@ from __future__ import annotations
 import html
 import re
 
+from tools.tts_ru_normalize import (
+    detect_speech_language as _detect_cyr,
+    normalize_symbols_cyrillic as _normalize_cyr,
+)
+
 # Sentinel appended to former heading lines so smooth_whitespace_for_tts can
 # fold a heading into the sentence that follows it ("Weather, it will be sunny")
 # rather than leaving a bare "Weather." label that reads abruptly aloud.
@@ -107,6 +112,12 @@ def normalize_symbols_for_tts(text: str) -> str:
         return ""
 
     text = str(text)
+    _cyr_lang = _detect_cyr(text)
+    if _cyr_lang:
+        text = _normalize_cyr(text, _cyr_lang)
+        text = _VARIATION_SELECTOR_RE.sub("", text)
+        text = _EMOJI_RE.sub("", text)
+        return text
     text = re.sub("[   ]", " ", text)  # non-breaking / thin spaces
     text = text.replace("\u2212", "-")  # minus sign
     text = text.replace("…", "...")  # ellipsis
@@ -204,7 +215,7 @@ def smooth_whitespace_for_tts(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-    text = re.sub(r"([,.;:!?])([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([,.;:!?])([A-Za-zЀ-ӿ])", r"\1 \2", text)
     text = re.sub(r"\.{4,}", "...", text)
     return text.strip()
 

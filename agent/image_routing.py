@@ -732,6 +732,93 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     return f"data:{mime};base64,{b64}"
 
 
+# MiniMax caps a base64 video data URL at 50 MB; the Files API route allows
+# 512 MB but needs a separate upload step we deliberately avoid here.
+_MAX_INLINE_VIDEO_BYTES = 50 * 1024 * 1024
+
+
+def video_input_enabled(cfg: Optional[Dict[str, Any]]) -> bool:
+    """Whether video attachments may be inlined for this profile.
+
+    Off unless ``agent.video_input`` says otherwise: the ``video_url`` content
+    block is not part of the shared OpenAI-compatible surface, and a provider
+    that does not know it rejects the *whole* request rather than skipping the
+    block. MiniMax-M3 accepts it; most others do not.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    agent_cfg = cfg.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        return False
+    return bool(agent_cfg.get("video_input"))
+
+
+def video_input_fps(cfg: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Frames sampled per second of video, or None to let the provider decide.
+
+    MiniMax accepts 0.2-5 and defaults to 1. Higher catches quick scene changes
+    at a higher token cost — a minute of video at fps=1 is 60 frames.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    agent_cfg = cfg.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        return None
+    raw = agent_cfg.get("video_fps")
+    if raw is None:
+        return None
+    try:
+        fps = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not 0.2 <= fps <= 5:
+        return None
+    return fps
+
+
+def build_native_video_parts(
+    video_paths: List[str],
+    fps: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build ``video_url`` content parts for locally cached videos.
+
+    Mirrors the image path: the file is read from disk and embedded as a base64
+    data URL, so the model sees the frames rather than a filename it cannot
+    open. Returns (parts, skipped); a file is skipped when it cannot be read or
+    is larger than the provider will accept, since a request over the cap
+    cannot succeed and there is no point spending the upload.
+    """
+    parts: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for raw_path in video_paths:
+        p = Path(raw_path)
+        if not p.exists() or not p.is_file():
+            skipped.append(str(raw_path))
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            skipped.append(str(raw_path))
+            continue
+        if size > _MAX_INLINE_VIDEO_BYTES:
+            skipped.append(str(raw_path))
+            continue
+        mime = mimetypes.guess_type(str(p))[0] or "video/mp4"
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            skipped.append(str(raw_path))
+            continue
+        block: Dict[str, Any] = {
+            "type": "video_url",
+            "video_url": {"url": f"data:{mime};base64,{base64.b64encode(raw).decode()}"},
+        }
+        if fps is not None:
+            block["video_url"]["fps"] = fps
+        parts.append(block)
+    return parts, skipped
+
+
 def build_native_content_parts(
     user_text: str,
     image_paths: List[str],
@@ -824,5 +911,8 @@ def build_native_content_parts(
 __all__ = [
     "decide_image_input_mode",
     "build_native_content_parts",
+    "build_native_video_parts",
+    "video_input_enabled",
+    "video_input_fps",
     "extract_image_refs",
 ]

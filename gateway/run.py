@@ -6193,6 +6193,7 @@ class TurnRunner:
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
             # runner instance don't re-attach stale images.
+            _native_vids = self._runner._consume_pending_native_video_paths(ctx.session_key)
             _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
             if _native_imgs:
                 try:
@@ -6219,6 +6220,45 @@ class TurnRunner:
                     _run_message = ctx.message
             else:
                 _run_message = ctx.message
+
+            # Videos ride the same multimodal content list. Appended after the
+            # image branch so a message carrying both keeps one text part and
+            # every attachment beside it.
+            if _native_vids:
+                try:
+                    from agent.image_routing import (
+                        build_native_video_parts,
+                        video_input_fps,
+                    )
+                    try:
+                        from hermes_cli.config import load_config as _load_cfg
+                        _vid_fps = video_input_fps(_load_cfg())
+                    except Exception:
+                        _vid_fps = None
+                    _vparts, _vskipped = build_native_video_parts(_native_vids, _vid_fps)
+                    if _vskipped:
+                        logger.warning(
+                            "Native video attachment: skipped %d path(s) (unreadable or over size cap): %s",
+                            len(_vskipped), _vskipped,
+                        )
+                    if _vparts:
+                        if isinstance(_run_message, list):
+                            _run_message = list(_run_message) + _vparts
+                        else:
+                            _text = str(_run_message or "").strip()
+                            _run_message = (
+                                [{"type": "text", "text": _text or "What is in this video?"}]
+                                + _vparts
+                            )
+                        logger.info(
+                            "Video attached inline: %d video(s), fps=%s",
+                            len(_vparts), _vid_fps if _vid_fps is not None else "provider default",
+                        )
+                except Exception as _vid_exc:
+                    logger.warning(
+                        "Native video attachment failed, falling back to text: %s",
+                        _vid_exc,
+                    )
 
             _api_run_message = _wrap_current_message_with_observed_context(
                 _run_message,
@@ -18034,6 +18074,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_text = f"{_note}\n\n{message_text}"
 
         if video_paths:
+            from agent.image_routing import video_input_enabled as _video_input_enabled
+            try:
+                from hermes_cli.config import load_config as _load_cfg
+                _cfg_for_video = _load_cfg()
+            except Exception:
+                _cfg_for_video = None
+            if _video_input_enabled(_cfg_for_video):
+                # Attach the frames themselves at the run_conversation call
+                # site, same one-shot contract as native images.
+                self._session_state(session_key).persistent.native_video_paths = list(
+                    video_paths
+                )
+                logger.info(
+                    "Video routing: native (agent.video_input on). %d video(s) will be attached inline.",
+                    len(video_paths),
+                )
+                video_paths = []
+
+        if video_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
             for _vpath in video_paths:
                 _basename = os.path.basename(_vpath)
@@ -18277,6 +18336,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for transcript in successful_transcripts
             if transcript.strip()
         )
+
+    def _consume_pending_native_video_paths(self, session_key: str) -> List[str]:
+        """Take and clear video paths staged for inline attachment."""
+        state = self._peek_session_state(session_key)
+        if state is None or not state.persistent.native_video_paths:
+            return []
+        paths = list(state.persistent.native_video_paths)
+        state.persistent.native_video_paths = []
+        return paths
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         state = self._peek_session_state(session_key)

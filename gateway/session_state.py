@@ -140,6 +140,9 @@ class PersistentState:
     update_prompt_pending: bool = False
     # Image paths staged for native (inline) attachment; consumed one-shot.
     native_image_paths: List[str] = field(default_factory=list)
+    # Video paths staged for inline attachment, same one-shot contract. Only
+    # filled when agent.video_input is on — see agent/image_routing.py.
+    native_video_paths: List[str] = field(default_factory=list)
     # Legacy runner-level pending message text (write-mostly; flushed to
     # disk on shutdown — see #72680).  NOTE: distinct from the adapter-level
     # ``_pending_messages`` (Dict[str, MessageEvent]) in gateway/base.py,

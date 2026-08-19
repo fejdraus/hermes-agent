@@ -330,6 +330,9 @@ def _get_langfuse() -> Optional[Langfuse]:
             "public_key": public_key,
             "secret_key": secret_key,
             "base_url": base_url,
+            # Applied by the SDK to every input/output before it looks for
+            # media, so base64 payloads never reach its decoder.
+            "mask": _mask_data_uris,
         }
         if environment:
             kwargs["environment"] = environment
@@ -422,6 +425,37 @@ def _state_for_turn(turn_id: str) -> Optional[str]:
 def _is_base64_data_uri(value: str) -> bool:
     prefix = value[:200].lower()
     return prefix.startswith("data:") and ";base64," in prefix
+
+
+def _mask_data_uris(*, data: Any, **_kwargs: Any) -> Any:
+    """Strip base64 data URIs anywhere in the payload before the SDK sees them.
+
+    ``_truncate_text`` already redacts the ones that pass through our own
+    serializers, but the SDK walks the payload itself and treats any
+    ``data:*;base64,`` string as media to decode and upload. Anything we did
+    not reach — a nested field past our depth limit, a value we never
+    serialized — reaches that decoder, and a truncated URI makes it log
+    "Error parsing base64 data URI" with a full traceback. That produced 642
+    tracebacks in agent.log between 09.08 and 19.08.2026, drowning real errors.
+
+    Observability wants the shape of the payload, not the pixels: replace the
+    URI with its metadata and the noise disappears without losing signal.
+    """
+    def walk(value: Any, depth: int = 0) -> Any:
+        if depth > 12:
+            return value
+        if isinstance(value, str):
+            return _redact_data_uri(value) if _is_base64_data_uri(value) else value
+        if isinstance(value, dict):
+            return {k: walk(v, depth + 1) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [walk(v, depth + 1) for v in value]
+        return value
+
+    try:
+        return walk(data)
+    except Exception:  # pragma: no cover - masking must never break tracing
+        return data
 
 
 def _redact_data_uri(value: str) -> dict[str, Any]:

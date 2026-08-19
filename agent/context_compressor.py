@@ -1394,29 +1394,83 @@ def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -
     return text + rendered if prepend else rendered + text
 
 
-def _strip_image_parts_from_parts(parts: Any) -> Any:
-    """Strip image parts from an OpenAI-style content-parts list.
+_MEDIA_PART_TYPES = frozenset({
+    "image", "image_url", "input_image",
+    "video", "video_url", "input_video",
+})
 
-    Returns a new list with image_url / image / input_image parts replaced
-    by a text placeholder, or None if the list had no images (callers
-    skip the replacement in that case). Used by the compressor to prune
-    old computer_use screenshots.
+
+def _media_part_reference(part: Dict[str, Any]) -> str:
+    """Human-readable trace of a media part whose payload is being dropped.
+
+    Keeps what stays useful after the bytes are gone: what kind of media it
+    was, and — when the caller attached one — the local path, so the agent can
+    re-open the file with a tool instead of asking the user to resend it.
+    The description of what was *in* the media survives separately, in the
+    assistant turn that answered it and in the summary built from this
+    history.
+    """
+    ptype = str(part.get("type") or "")
+    kind = "video" if "video" in ptype else "image"
+
+    path = ""
+    meta = part.get("_meta")
+    if isinstance(meta, dict) and meta.get("path"):
+        path = str(meta["path"])
+    if not path:
+        candidates = [part.get("video_url"), part.get("image_url")]
+        # Anthropic-native shape: {"type": "video", "source": {"type": "url", ...}}
+        source = part.get("source")
+        if isinstance(source, dict) and source.get("type") == "url":
+            candidates.append(source)
+        for value in candidates:
+            if isinstance(value, dict):
+                url = str(value.get("url") or "")
+            else:
+                url = str(value or "")
+            # a data: URL is the payload itself — no reusable handle in it
+            if url and not url.startswith("data:"):
+                path = url
+                break
+
+    where = f" at: {path}" if path else ""
+    if kind == "image":
+        # Keep the long-standing wording: screenshots are the common case here
+        # and existing behaviour (and its tests) key off this phrase.
+        return f"[screenshot removed to save context{where}]"
+    return f"[video attachment{where} — payload dropped to save context; described above]"
+
+
+def _strip_image_parts_from_parts(parts: Any) -> Any:
+    """Strip media payloads from an OpenAI-style content-parts list.
+
+    Returns a new list with image / video parts replaced by a text reference,
+    or None if the list had no media (callers skip the replacement in that
+    case). Used by the compressor to prune old computer_use screenshots — and,
+    far more importantly, video: a clip is megabytes of base64 that would
+    otherwise ride along in every later request of the session. Observed on
+    Paul: two videos totalling 2.6 MB replayed on every turn, so compression
+    reported 238K tokens in and 718K out — the text shrank while the media
+    stayed.
+
+    The bytes go; the meaning stays. What the media showed is already in the
+    assistant turn that answered it, and that text is what the summary is
+    built from.
     """
     if not isinstance(parts, list):
         return None
-    had_image = False
+    had_media = False
     out = []
     for part in parts:
         if not isinstance(part, dict):
             out.append(part)
             continue
-        ptype = part.get("type")
-        if ptype in {"image", "image_url", "input_image"}:
-            had_image = True
-            out.append({"type": "text", "text": "[screenshot removed to save context]"})
+        if part.get("type") in _MEDIA_PART_TYPES:
+            had_media = True
+            out.append({"type": "text", "text": _media_part_reference(part)})
         else:
             out.append(part)
-    return out if had_image else None
+    return out if had_media else None
 
 
 def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
@@ -3395,6 +3449,38 @@ class ContextCompressor(ContextEngine):
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
+
+    def _prune_user_media_payloads(
+        self, messages: List[Dict[str, Any]], protect_tail_count: int,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Drop image/video payloads from older user turns, keep a reference.
+
+        Tool results get pruned by ``_prune_old_tool_results``; user turns had
+        no equivalent pass, so an attached video stayed in the history forever
+        and rode along in every later request. A 1.6 MB clip is ~2.1 MB of
+        base64 — on Paul that made "compression" report 238K tokens in and
+        718K out, because the text shrank while two videos did not.
+
+        The newest ``protect_tail_count`` messages keep their media: that is
+        the turn the user is still talking about. Older ones keep a text
+        reference (kind + path when known); what the media actually showed
+        already lives in the assistant reply that answered it, which is what
+        the summary is written from.
+        """
+        if not messages:
+            return messages, 0
+        boundary = max(0, len(messages) - max(0, protect_tail_count))
+        result = list(messages)
+        pruned = 0
+        for idx in range(boundary):
+            msg = result[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            stripped = _strip_image_parts_from_parts(msg.get("content"))
+            if stripped is not None:
+                result[idx] = {**msg, "content": stripped}
+                pruned += 1
+        return (result, pruned) if pruned else (messages, 0)
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
@@ -6993,6 +7079,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
+
+        # Phase 1b: drop media payloads from older user turns (also no LLM call).
+        messages, media_pruned = self._prune_user_media_payloads(
+            messages, protect_tail_count=self.protect_last_n,
+        )
+        if media_pruned and not self.quiet_mode:
+            logger.info(
+                "Pre-compression: dropped media payloads from %d user turn(s)", media_pruned
+            )
 
         latest_actionable_idx = self._find_last_user_message_idx(messages, 0)
         blank_echo_indices = self._blank_echo_indices_after(

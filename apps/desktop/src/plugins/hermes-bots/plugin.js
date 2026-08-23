@@ -29,6 +29,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
   ConfirmDialog,
+  CopyButton,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -61,13 +62,22 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const { McpTab, ToolsetConfigPanel } = sdk
 // Keep optional exports feature-detected; test harnesses may strip the SDK namespace.
 const SkillsView = typeof sdk === 'undefined' ? undefined : sdk.SkillsView
+// TRUE only on builds whose SkillsView routes `fixedConnection` to the pinned
+// registry connection's backend. Older builds export SkillsView WITHOUT the
+// prop — rendering it for a remote-target draft there would read/write the
+// ACTIVE gateway's skills under the remote bot's name (the wrong machine),
+// so those builds keep the staged checklists for remote targets.
+const skillsViewRoutesConnections = Boolean(SkillsView && SkillsView.supportsFixedConnection)
 const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
+// Deterministic blob avatars (name → face). Feature-detected: older SDKs
+// without the export fall back to the legacy math-face shapes below.
+const blobatarSvg = typeof sdk === 'undefined' ? undefined : sdk.blobatarSvg
 // Budgeted render loop (fps cap + observability pause + dormancy + teardown).
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
@@ -76,6 +86,12 @@ const ID = 'hermes-bots'
 const ROSTER_KEY = [ID, 'roster']
 const ROUTINES_KEY = [ID, 'routines']
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const BOT_META_V1_KEY = 'bot-meta'
+const BOT_META_V2_KEY = 'bot-meta-v2'
+const BOT_META_MIGRATION_KEY = 'bot-meta-v2-migrated'
+let botMetaV2Active = false
+let botMetaV2Commit = Promise.resolve()
+const migratedLocalRoutes = new Map()
 
 /** Captured in register() so components can reach plugin storage. */
 let pluginCtx = null
@@ -110,15 +126,20 @@ function setActivityToasts(enabled) {
 }
 
 /** Detect new inbound activity from a fresh roster: last_active moved past
- *  the watermark for a bot whose chat isn't on screen -> unread + toast. */
+ *  the watermark for a bot whose chat isn't on screen -> unread + toast.
+ *  Watermarks follow botActivitySession (canonical Bot Chat included) —
+ *  last_session alone never sees the hidden Bot Chat, so DMs delivered
+ *  there would neither badge nor toast. */
 function trackInboundActivity(roster) {
   const seeding = !watermarksSeeded
   watermarksSeeded = true
 
   for (const bot of roster) {
-    const ts = bot.last_session?.last_active || 0
-    const prev = rosterWatermarks.get(bot.name) || 0
-    rosterWatermarks.set(bot.name, Math.max(prev, ts))
+    const key = botSelectionKey(bot)
+    const activity = botActivitySession(bot)
+    const ts = activity?.last_active || 0
+    const prev = rosterWatermarks.get(key) || 0
+    rosterWatermarks.set(key, Math.max(prev, ts))
 
     if (seeding || ts <= prev) {
       continue
@@ -126,24 +147,24 @@ function trackInboundActivity(roster) {
 
     // Activity in the bot the user is currently looking at is already
     // visible — never badge the open chat.
-    if ($selectedBot.get() === bot.name) {
+    if ($selectedBot.get() === key) {
       continue
     }
 
-    $botUnread.set({ ...$botUnread.get(), [bot.name]: true })
+    $botUnread.set({ ...$botUnread.get(), [key]: true })
 
     // Roster-hidden bots stay quiet: the unread flag above accumulates
     // silently (unhiding reveals the badge) but a hidden bot never toasts.
-    if ($botMeta.get()[bot.name]?.hidden) {
+    if (botRosterMeta(bot, $botMeta.get())?.hidden) {
       continue
     }
 
     // Toasts are opt-in: the unread badge is always set above, but the
     // per-message notification fires only when the user enabled it.
     if ($activityToasts.get()) {
-      const meta = $botMeta.get()[bot.name]
+      const meta = botRosterMeta(bot, $botMeta.get())
       const label = displayName(bot, meta)
-      const preview = (bot.last_session?.preview || '').trim()
+      const preview = (activity?.preview || '').trim()
       const inbound = /^Message from/i.test(preview)
 
       host.notify({
@@ -163,32 +184,996 @@ const $lastJobs = atom([])
 // sessions are room plumbing — neither is a scratch conversation, and a
 // 6-member room would otherwise dump six identical "Group: ..." rows into
 // recents. Backed by the core generic `hidden` session flag (session.create
-// hidden:true / session.set_hidden); the Bots pane browses them via
-// session.list include_hidden. Older gateways ignore the flag and the
+// hidden:true / session.set_hidden). Older gateways ignore the flag and the
 // sessions simply stay visible there.
 
 /** Bot the Routines tile is scoped to. Follows the live gateway profile
  *  (the bot you're actually chatting with) and roster clicks. */
 const $selectedBot = atom('default')
 
-/** Optional secondary navigation inside the Bots pane. Primary row clicks still
- * open the bot's canonical chat; this state opens its stored-session browser. */
-const $botSessionsWorkspace = atom(null)
-const $botSelectedSessions = atom({})
-const $sessionsGatewayGeneration = atom(0)
+/** Owner of the chat the user is LOOKING AT. Newer desktops expose a
+ *  connection-qualified owner. Older builds synthesize the previous
+ *  profile/gateway fallback and listen to both atoms when available. */
+const $focusedBotProfile = host.state.focusedSessionProfile || host.state.profile
+
+/** Profile that owns the chat currently on screen. Bot Mode opens another
+ *  profile's session without moving the gateway socket, so mention filtering
+ *  and sender identity must follow focus rather than host.state.profile. */
+function focusedMentionProfile() {
+  return String($focusedBotProfile.get?.() || '').trim() || 'default'
+}
+
+function fallbackFocusedBotOwner(profile = $focusedBotProfile.get?.()) {
+  const focusedProfile = String(profile || 'default').trim() || 'default'
+  const activeProfile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+
+  // focusedSessionProfile without focusedSessionOwner is a legacy half-shape:
+  // it carries no source identity. Only reuse the active connection when the
+  // focused profile is also the active profile; otherwise fail closed rather
+  // than manufacturing a cross-source owner from unrelated atoms.
+  if (host.state.focusedSessionProfile && focusedProfile !== activeProfile) {
+    return null
+  }
+
+  const connectionId = String(
+    host.state.connectionId?.get?.() ||
+    (typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : '') ||
+    ''
+  ).trim()
+
+  return {
+    authoritative: false,
+    connectionId,
+    profile: focusedProfile
+  }
+}
+
+const hasFocusedSessionOwnerSupport = Boolean(host.state.focusedSessionOwner)
+const $focusedBotOwner = host.state.focusedSessionOwner || {
+  get: () => fallbackFocusedBotOwner(),
+  listen: listener => {
+    const emit = profile => listener(fallbackFocusedBotOwner(profile))
+    const unbindProfile = $focusedBotProfile.listen(emit)
+    const unbindConnection = host.state.connectionId?.listen?.(() => emit($focusedBotProfile.get?.()))
+
+    return () => {
+      unbindProfile?.()
+      unbindConnection?.()
+    }
+  }
+}
+
+function focusedRosterOwner(owner) {
+  const name = String(owner?.profile || owner?.name || '').trim()
+
+  if (!owner || !name) {
+    return null
+  }
+
+  return {
+    authoritative: owner.authoritative !== false,
+    connectionId: String(owner.connectionId || '').trim(),
+    name
+  }
+}
+
+/** Optional secondary navigation inside the Bots pane (group-chat rooms). */
 
 /** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
  *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
 const $groupChats = atom({})
-/** Group whose room view is open in the Bots pane (secondary navigation,
- *  same pattern as $botSessionsWorkspace). */
+/** Group whose room view is open in the Bots pane (secondary navigation
+ *  inside the pane; a normal row click returns to the roster). */
 const $groupChatWorkspace = atom(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
+// Pending prompts (clarify questions AND command approvals) raised inside
+// hidden group-member sessions, keyed `${group}::${memberKey}` (#90694).
+// Members run in invisible plumbing sessions, so a member's blocking prompt
+// used to park server-side with no surface to answer it — the user saw
+// "is thinking…" until the prompt timeout. The turn poll mirrors each
+// member's `pending_clarify` / `pending_approval` resume fields in here;
+// the room renders answer cards from it.
+const $groupClarify = atom({})
+
+// ── group activity feed ─────────────────────────────────────────────────────
+// Runtime-only, bounded per-room record of turn events that feeds the
+// collapsible Activity view. Never persisted — it is presentation state like
+// running/epoch, and the room transcript (log) stays the only durable record.
+// Every event is tagged with the room epoch it belongs to, so the view shows
+// only the CURRENT run: a newer send bumps the epoch (old-run events drop
+// away), and a rename re-keys the room (the feed starts clean under the new
+// name — stale events under the old key simply have no room to attach to).
+const GROUP_ACTIVITY_LIMIT = 50
+const $groupActivity = atom({})
+
+function recordGroupActivity(group, event) {
+  const room = $groupChats.get()[group]
+
+  if (!room) {
+    return null
+  }
+
+  const current = $groupActivity.get()[group] || { events: [] }
+  const entry = { at: Date.now(), epoch: room.epoch || 0, ...event }
+  const events = [...current.events, entry].slice(-GROUP_ACTIVITY_LIMIT)
+  $groupActivity.set({ ...$groupActivity.get(), [group]: { ...current, events } })
+
+  return entry
+}
+
+/** Events for the room's CURRENT run — superseded runs (epoch moved on)
+ *  are dropped from view instead of describing work that already ended. */
+function currentGroupActivity(group) {
+  const epoch = ($groupChats.get()[group] || {}).epoch || 0
+  return ($groupActivity.get()[group] || {}).events?.filter(event => (event.epoch || 0) === epoch) || []
+}
+
+/** Human label for one activity event, used by the collapsed summary and
+ *  the expanded rows. */
+function groupActivityLabel(event) {
+  const kind = event?.kind
+  const base = GROUP_ACTIVITY_LABELS[kind] || kind || 'did something'
+
+  if (kind === 'cancelled' || kind === 'settled') {
+    return base
+  }
+
+  const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
+
+  return `${who} ${base}`
+}
+
+const GROUP_ACTIVITY_LABELS = {
+  queued: 'sent a message',
+  working: 'is working…',
+  replied: 'replied',
+  passed: 'passed',
+  'timed-out': 'took too long',
+  failed: 'hit an error',
+  cancelled: 'turn interrupted by a newer message',
+  settled: 'turn settled',
+  delivered: 'delivered a late reply'
+}
+
+const GROUP_ACTIVITY_GLYPHS = {
+  queued: 'comment',
+  working: 'sync',
+  replied: 'check',
+  passed: 'circle-outline',
+  'timed-out': 'clock',
+  failed: 'error',
+  cancelled: 'close',
+  settled: 'check-all',
+  delivered: 'mail-read'
+}
+
+/** Text tone for an activity row: quiet for pass/cancel/settle, accent for
+ *  work and real replies, destructive for failures and timeouts. */
+function groupActivityTone(kind) {
+  if (kind === 'failed' || kind === 'timed-out') {
+    return 'text-destructive'
+  }
+
+  if (kind === 'working' || kind === 'replied' || kind === 'delivered') {
+    return 'text-(--ui-accent,#4f9cf9)'
+  }
+
+  return 'text-(--ui-text-tertiary)'
+}
+
+const GROUP_CHAT_SYNC_META_KEY = 'hermes-bots-groups'
+// Gateway ui_meta is capped after Python JSON serialization. Keep a healthy
+// margin below that limit because Python escapes Unicode while JS does not.
+const GROUP_CHAT_SYNC_MAX_BYTES = 48000
+const GROUP_CHAT_SYNC_MESSAGES = 16
+const GROUP_CHAT_SYNC_TEXT_CHARS = 1200
+const GROUP_CHAT_SYNC_IMAGE_CHARS = 24000
+let groupChatSyncTimer = null
+// Fan-out scheduler state, keyed by gateway connectionId ('' = active/local).
+// Every connected gateway carries the full projection so a room survives any
+// single gateway being removed and surfaces on every remote backend.
+const groupChatSyncPendingByConnection = new Map()
+const groupChatSyncInFlightConnections = new Set()
+const groupChatSyncRetryTimers = new Map()
+const groupChatSyncRetryCounts = new Map()
+let groupChatSyncDisposed = false
+
+/** Conservative byte count for the gateway's ensure_ascii JSON encoding.
+ *  Python also inserts separator spaces, so reserve one extra byte per JS
+ *  structural separator on top of escaped Unicode code-point widths. */
+function groupChatGatewayJsonSize(value) {
+  const json = JSON.stringify(value)
+  let bytes = 0
+
+  for (const character of json) {
+    const codePoint = character.codePointAt(0)
+
+    if (codePoint <= 0x7f) {
+      bytes += 1
+      if (character === ',' || character === ':') {
+        bytes += 1
+      }
+    } else {
+      bytes += codePoint <= 0xffff ? 6 : 12
+    }
+  }
+
+  return bytes
+}
+
+/** Durable room identity for the sync projection. Rooms minted on current
+ *  builds carry an immutable roomId; the projection keys rooms by
+ *  `id:<roomId>` so rename is a display-name edit, not a distributed
+ *  delete+create, and disband tombstones follow the room itself. Legacy
+ *  rooms (no roomId) fall back to `name:<name>` keys with the older
+ *  revision-gated tombstone semantics. */
+function groupChatRoomKey(name, room) {
+  return typeof room?.roomId === 'string' && room.roomId
+    ? `id:${room.roomId}`
+    : `name:${String(name)}`
+}
+
+/** Lift any historical projection shape (v1 wall-clock, v2 name-keyed) to
+ *  the v3 room-key shape so one merge path serves mixed-version fleets. */
+function normalizeGroupChatSyncSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return { version: 3, rooms: {}, deleted: {} }
+  }
+  if (Number(snapshot.version || 0) >= 3) {
+    return {
+      version: 3,
+      updatedAt: Number(snapshot.updatedAt || 0),
+      rooms: snapshot.rooms && typeof snapshot.rooms === 'object' ? snapshot.rooms : {},
+      deleted: snapshot.deleted && typeof snapshot.deleted === 'object' ? snapshot.deleted : {}
+    }
+  }
+  const rooms = {}
+  for (const [name, room] of Object.entries(snapshot.rooms || {})) {
+    if (!room || !Array.isArray(room.log)) {
+      continue
+    }
+    rooms[`name:${name}`] = { ...room, name }
+  }
+  const deleted = {}
+  for (const [name, at] of Object.entries(snapshot.deleted || {})) {
+    // v1 tombstones carried wall-clock ms, not gateway revisions — they must
+    // not outrank real revisions (same rule groupChatSyncDeletedRevision
+    // applied before v3).
+    deleted[`name:${name}`] = Number(snapshot.version || 0) >= 2 ? Math.max(0, Number(at || 0)) : 0
+  }
+  return { version: 3, updatedAt: Number(snapshot.updatedAt || 0), rooms, deleted }
+}
+
+/** Compact, display-oriented copy of Desktop's room log for gateway clients.
+ *  The live orchestration state stays in plugin storage; this bounded mirror
+ *  rides the default profile's ui_meta so mobile can show the same messages.
+ *  Newest rooms/messages win when the profile metadata size cap is reached. */
+function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
+  const ranked = Object.entries(all || {})
+    // Empty runtime tombstones are used to stop an in-flight room after
+    // disband. They are not real rooms and must never reappear on mobile.
+    .filter(([, room]) => room && Array.isArray(room.log) && room.log.length > 0)
+    .sort(([, left], [, right]) => {
+      const leftAt = Number(left.log[left.log.length - 1]?.at || 0)
+      const rightAt = Number(right.log[right.log.length - 1]?.at || 0)
+      return rightAt - leftAt
+    })
+  const rooms = {}
+  const boundedDeleted = Object.fromEntries(
+    Object.entries(deleted)
+      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
+      .slice(0, 64)
+  )
+  const envelope = {
+    version: 3,
+    updatedAt: Date.now(),
+    rooms,
+    ...(Object.keys(boundedDeleted).length ? { deleted: boundedDeleted } : {})
+  }
+
+  for (const [name, room] of ranked) {
+    const log = room.log.slice(-GROUP_CHAT_SYNC_MESSAGES).map(entry => ({
+      ...(entry?.id ? { id: String(entry.id).slice(0, 160) } : {}),
+      from: {
+        kind: entry?.from?.kind === 'member' ? 'member' : 'user',
+        name: String(entry?.from?.name || (entry?.from?.kind === 'member' ? 'Bot' : 'You')).slice(0, 128),
+        ...(entry?.from?.source ? { source: String(entry.from.source).slice(0, 128) } : {})
+      },
+      text: String(entry?.text || '').slice(0, GROUP_CHAT_SYNC_TEXT_CHARS),
+      at: Number(entry?.at || 0),
+      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {})
+    }))
+    const compact = {
+      name: String(name).slice(0, 64),
+      ...(typeof room?.roomId === 'string' && room.roomId ? { roomId: String(room.roomId).slice(0, 128) } : {}),
+      log,
+      revision: Math.max(0, Number(room?.syncRevision ?? room?.revision ?? 0)),
+      members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS).map(member => ({
+        name: String(member?.name || '').slice(0, 128),
+        ...(member?.handle ? { handle: String(member.handle).slice(0, 128) } : {}),
+        ...(member?.connectionId ? { connectionId: String(member.connectionId).slice(0, 128) } : {}),
+        ...(member?.connectionKind ? { connectionKind: String(member.connectionKind).slice(0, 64) } : {}),
+        ...(member?.connectionLabel ? { connectionLabel: String(member.connectionLabel).slice(0, 128) } : {}),
+        ...(member?.sourceScoped ? { sourceScoped: true } : {})
+      })),
+      ...(typeof room?.image === 'string' && room.image.length <= GROUP_CHAT_SYNC_IMAGE_CHARS
+        ? { image: room.image }
+        : {})
+    }
+
+    const key = groupChatRoomKey(name, room)
+    rooms[key] = compact
+    while (compact.log.length > 1 && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+      compact.log.shift()
+    }
+    if (compact.image && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+      delete compact.image
+    }
+    if (groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+      delete rooms[key]
+    }
+  }
+
+  return envelope
+}
+
+function groupChatSyncEntryKey(entry) {
+  if (entry?.id) {
+    return `id:${String(entry.id)}`
+  }
+  return JSON.stringify([
+    Number(entry?.at || 0),
+    String(entry?.from?.kind || ''),
+    String(entry?.from?.name || ''),
+    String(entry?.from?.source || ''),
+    // Threadless entries (pre-thread rooms, older Desktop builds) get
+    // SYNTHETIC `legacy-N` ids from assignLegacyThreads. Those ids are
+    // position-derived — not stable across a gateway round-trip (the
+    // projection copy may be threadless or numbered differently). Collapse
+    // the whole synthetic family to one bucket, or the merge duplicates
+    // every id-less entry — shifting watermarks and manufacturing phantom
+    // member turns that re-submit into busy sessions.
+    String(entry?.thread || 'legacy').replace(/^legacy-\d+$/, 'legacy'),
+    String(entry?.text || '')
+  ])
+}
+
+function groupChatSyncMemberKey(member) {
+  return JSON.stringify([
+    String(member?.source || ''),
+    String(member?.connectionId || ''),
+    String(member?.connectionLabel || ''),
+    String(member?.handle || ''),
+    String(member?.name || '')
+  ])
+}
+
+function groupChatSyncDeletedRevision(source, value) {
+  return Number(source?.version || 0) >= 2 ? Math.max(0, Number(value || 0)) : 0
+}
+
+/** Merge two bounded projections without treating an absent room/message as
+ *  deletion. Rooms are identified by durable room keys (id:<roomId> when the
+ *  room carries one), so a rename is a same-key field update — never a
+ *  distributed delete+create — and a disband tombstone follows the room
+ *  itself. Gateway revisions order identity/membership/picture and
+ *  tombstones; stable message ids make concurrent log union idempotent.
+ *  `changedRooms`/`deletedRooms` accept display names or room keys. */
+function mergeGroupChatSyncSnapshots(
+  remote,
+  local,
+  { changedRooms = [], deletedRooms = [], writeRevision = 0 } = {}
+) {
+  const remoteNorm = normalizeGroupChatSyncSnapshot(remote)
+  const localNorm = normalizeGroupChatSyncSnapshot(local)
+  const keysFor = (label, norm) => {
+    const keys = new Set()
+    for (const [key, room] of Object.entries(norm.rooms || {})) {
+      if (key === label || String(room?.name || '') === label || key === `name:${label}`) {
+        keys.add(key)
+      }
+    }
+    if (String(label).startsWith('id:') || String(label).startsWith('name:')) {
+      keys.add(label)
+    } else if (!keys.size) {
+      keys.add(`name:${label}`)
+    }
+    return keys
+  }
+  const changed = new Set()
+  for (const label of changedRooms) {
+    for (const key of keysFor(label, localNorm)) {
+      changed.add(key)
+    }
+  }
+  const deleted = {}
+  for (const source of [remoteNorm, localNorm]) {
+    for (const [key, at] of Object.entries(source.deleted || {})) {
+      deleted[key] = Math.max(Number(deleted[key] || 0), Math.max(0, Number(at || 0)))
+    }
+  }
+  for (const label of deletedRooms) {
+    for (const key of new Set([...keysFor(label, remoteNorm), ...keysFor(label, localNorm)])) {
+      // Rename passes changedRooms:[newName] + deletedRooms:[oldName]. For an
+      // id-keyed room both labels resolve to the SAME durable key (the remote
+      // copy still carries the old display name), and id tombstones are
+      // final — so tombstoning here would kill the room being renamed. A key
+      // that is being written this cycle is a rename target, not a disband.
+      if (changed.has(key)) {
+        continue
+      }
+      deleted[key] = Math.max(Number(deleted[key] || 0), Number(writeRevision || 0))
+    }
+  }
+
+  const rooms = {}
+  const roomKeys = new Set([...Object.keys(remoteNorm.rooms || {}), ...Object.keys(localNorm.rooms || {})])
+  for (const key of roomKeys) {
+    const remoteRoom = remoteNorm.rooms?.[key]
+    const localRoom = localNorm.rooms?.[key]
+    if ((!remoteRoom || !Array.isArray(remoteRoom.log)) && (!localRoom || !Array.isArray(localRoom.log))) {
+      continue
+    }
+    const remoteRevision = Math.max(0, Number(remoteRoom?.revision || 0))
+    const localRevision = changed.has(key)
+      ? Math.max(0, Number(writeRevision || 0))
+      : Math.max(0, Number(localRoom?.revision || 0))
+    const entries = new Map()
+    for (const entry of [...(remoteRoom?.log || []), ...(localRoom?.log || [])]) {
+      entries.set(groupChatSyncEntryKey(entry), entry)
+    }
+
+    // Identity fields (display name, membership, picture) follow the higher
+    // revision; a tie unions members and prefers the local writer's fields.
+    let identity
+    let members
+    let image
+    if (localRevision > remoteRevision) {
+      identity = localRoom
+      members = [...(localRoom?.members || [])]
+      image = localRoom?.image
+    } else if (remoteRevision > localRevision) {
+      identity = remoteRoom
+      members = [...(remoteRoom?.members || [])]
+      image = remoteRoom?.image
+    } else {
+      identity = localRoom || remoteRoom
+      const byId = new Map()
+      for (const member of [...(remoteRoom?.members || []), ...(localRoom?.members || [])]) {
+        byId.set(groupChatSyncMemberKey(member), member)
+      }
+      members = [...byId.values()]
+      image = Object.prototype.hasOwnProperty.call(localRoom || {}, 'image') ? localRoom.image : remoteRoom?.image
+    }
+    rooms[key] = {
+      ...(identity?.name ? { name: identity.name } : {}),
+      ...(identity?.roomId || (key.startsWith('id:') ? key.slice(3) : '')
+        ? { roomId: identity?.roomId || key.slice(3) }
+        : {}),
+      log: [...entries.values()].sort((left, right) => {
+        const byTime = Number(left?.at || 0) - Number(right?.at || 0)
+        return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
+      }),
+      members,
+      revision: Math.max(remoteRevision, localRevision),
+      ...(typeof image === 'string' && image ? { image } : {})
+    }
+  }
+
+  for (const [key, deletedRevision] of Object.entries(deleted)) {
+    if (key.startsWith('id:')) {
+      // Tombstones for id-keyed rooms are FINAL: the roomId is minted once
+      // and never reused (same-name recreation mints a fresh id), so a
+      // resurrect-by-revision race is structurally impossible. Keep the
+      // tombstone even when a lagging gateway's copy carries a higher
+      // revision — that copy is the resurrection this exists to prevent.
+      delete rooms[key]
+    } else if (Number(deletedRevision || 0) >= Number(rooms[key]?.revision || 0)) {
+      delete rooms[key]
+    } else {
+      delete deleted[key]
+    }
+  }
+
+  return groupChatSyncEnvelope(rooms, deleted)
+}
+
+/** Assemble + size-bound a v3 envelope from already-compacted rooms. */
+function groupChatSyncEnvelope(rooms, deleted = {}) {
+  const boundedDeleted = Object.fromEntries(
+    Object.entries(deleted)
+      .sort(([, left], [, right]) => Number(right || 0) - Number(left || 0))
+      .slice(0, 64)
+  )
+  const envelope = {
+    version: 3,
+    updatedAt: Date.now(),
+    rooms,
+    ...(Object.keys(boundedDeleted).length ? { deleted: boundedDeleted } : {})
+  }
+  const ranked = Object.entries(rooms).sort(([, left], [, right]) => {
+    const leftAt = Number(left?.log?.[left.log.length - 1]?.at || 0)
+    const rightAt = Number(right?.log?.[right.log.length - 1]?.at || 0)
+    return leftAt - rightAt
+  })
+  for (const [key, room] of ranked) {
+    while ((room.log?.length || 0) > 1 && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+      room.log.shift()
+    }
+    if (room.image && groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+      delete room.image
+    }
+    if (groupChatGatewayJsonSize(envelope) > GROUP_CHAT_SYNC_MAX_BYTES) {
+      delete rooms[key]
+    }
+  }
+  return envelope
+}
+
+/** Merge the gateway's bounded display projection into Desktop's richer room
+ *  state without discarding local session/watermark/runtime fields. Missing
+ *  remote rooms/messages are not deletions; only explicit tombstones remove a
+ *  room, and a genuinely newer local message wins over a stale tombstone. */
+function mergeRemoteGroupChatSnapshotIntoRooms(
+  remote,
+  current = $groupChats.get(),
+  { preserveRooms = [], deletedRooms = [] } = {}
+) {
+  const remoteNorm = normalizeGroupChatSyncSnapshot(remote)
+  const rooms = { ...(current || {}) }
+  const preserved = new Set(preserveRooms)
+  const locallyDeleted = new Set(deletedRooms)
+
+  // Local rooms indexed by durable identity so an id-keyed projection room
+  // finds its local twin even when the display name changed remotely.
+  const localByRoomId = new Map()
+  for (const [name, room] of Object.entries(rooms)) {
+    if (typeof room?.roomId === 'string' && room.roomId) {
+      localByRoomId.set(room.roomId, name)
+    }
+  }
+
+  for (const [key, projected] of Object.entries(remoteNorm.rooms || {})) {
+    if (!projected || !Array.isArray(projected.log)) {
+      continue
+    }
+    const projectedRoomId = projected.roomId || (key.startsWith('id:') ? key.slice(3) : null)
+    const localName = projectedRoomId && localByRoomId.has(projectedRoomId)
+      ? localByRoomId.get(projectedRoomId)
+      : (projected.name && rooms[projected.name] ? projected.name : null)
+    const displayName = String(projected.name || localName || (key.startsWith('name:') ? key.slice(5) : key))
+    if (locallyDeleted.has(displayName) || (localName && locallyDeleted.has(localName))) {
+      // Mid-rename guard: the remote copy may still be under the OLD display
+      // name while the local record was already re-keyed (same roomId, new
+      // name). That old name sits in deletedRooms, but the local record is
+      // the rename in flight — deleting it here would kill the renamed room.
+      if (localName && localName !== displayName && !locallyDeleted.has(localName)) {
+        continue
+      }
+      delete rooms[displayName]
+      if (localName) {
+        delete rooms[localName]
+      }
+      continue
+    }
+    const existing = (localName ? rooms[localName] : rooms[displayName]) || {}
+    const remoteRevision = Math.max(0, Number(projected.revision || 0))
+    const localRevision = Math.max(0, Number(existing.syncRevision || 0))
+    const entries = new Map(
+      (Array.isArray(existing.log) ? existing.log : []).map(entry => [groupChatSyncEntryKey(entry), entry])
+    )
+    const members = new Map(
+      (Array.isArray(existing.members) ? existing.members : []).map(member => [groupChatSyncMemberKey(member), member])
+    )
+
+    for (const entry of projected.log) {
+      const entryKey = groupChatSyncEntryKey(entry)
+      // The projection is COMPACT (truncated text, no images). When the same
+      // entry exists locally, the local rich copy is authoritative — merging
+      // the compact twin over it would strip attachments and retrigger
+      // watermark deltas for members that already saw it (phantom rounds).
+      if (!entries.has(entryKey)) {
+        entries.set(entryKey, entry)
+      }
+    }
+    const isPreserved = preserved.has(displayName) || (localName && preserved.has(localName))
+    if (!isPreserved) {
+      if (remoteRevision > localRevision) {
+        members.clear()
+      }
+      for (const member of Array.isArray(projected.members) ? projected.members : []) {
+        members.set(groupChatSyncMemberKey(member), { ...member, remoteSource: true })
+      }
+    }
+
+    const log = assignLegacyThreads(
+      [...entries.values()].sort((left, right) => {
+        const byTime = Number(left?.at || 0) - Number(right?.at || 0)
+        return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
+      })
+    )
+    const bounded = trimGroupChatLog(log, existing.watermarks || {})
+
+    // A remote rename with a higher revision moves the local record to the
+    // new display name; local views keyed by the old name follow on the
+    // next repaint (roster derives from $groupChats keys).
+    const targetName = !isPreserved && remoteRevision > localRevision ? displayName : (localName || displayName)
+    if (localName && targetName !== localName) {
+      delete rooms[localName]
+    }
+
+    rooms[targetName] = {
+      ...existing,
+      log: bounded.log,
+      watermarks: bounded.watermarks,
+      sessions: existing.sessions && typeof existing.sessions === 'object' ? existing.sessions : {},
+      stranded: existing.stranded && typeof existing.stranded === 'object' ? existing.stranded : {},
+      members: [...members.values()],
+      ...(projectedRoomId || existing.roomId ? { roomId: existing.roomId || projectedRoomId } : {}),
+      image: isPreserved
+        ? existing.image || null
+        : remoteRevision >= localRevision && Object.prototype.hasOwnProperty.call(projected, 'image')
+          ? projected.image || null
+          : existing.image || null,
+      syncRevision: isPreserved ? localRevision : Math.max(remoteRevision, localRevision),
+      epoch: Number(existing.epoch || 0),
+      running: Boolean(existing.running)
+    }
+  }
+
+  for (const [key, deletedAt] of Object.entries(remoteNorm.deleted || {})) {
+    const deletedRoomId = key.startsWith('id:') ? key.slice(3) : null
+    const targetName = deletedRoomId && localByRoomId.has(deletedRoomId)
+      ? localByRoomId.get(deletedRoomId)
+      : key.startsWith('name:') ? key.slice(5) : null
+    if (!targetName || preserved.has(targetName)) {
+      continue
+    }
+    if (deletedRoomId) {
+      // Id tombstones are final — the id is never reused, so there is no
+      // legitimate higher-revision recreation to protect.
+      delete rooms[targetName]
+    } else {
+      const deletedRevision = Math.max(0, Number(deletedAt || 0))
+      if (deletedRevision >= Number(rooms[targetName]?.syncRevision || 0)) {
+        delete rooms[targetName]
+      }
+    }
+  }
+  for (const name of locallyDeleted) {
+    delete rooms[name]
+  }
+
+  return rooms
+}
+
+function durableGroupChatRooms(all = $groupChats.get()) {
+  const durable = {}
+
+  for (const [name, room] of Object.entries(all || {})) {
+    if (!room || !Array.isArray(room.log)) {
+      continue
+    }
+    // Disband tombstones are runtime-only coordination state (they hold the
+    // epoch bump for an in-flight drive). Persisting one would resurrect the
+    // room as an empty record on the next load AND keep its name "taken" for
+    // same-name recreates. Mirrors updateGroupChat's inline durable map.
+    if (room.tombstone) {
+      continue
+    }
+    durable[name] = {
+      log: room.log,
+      watermarks: room.watermarks || {},
+      sessions: room.sessions || {},
+      stranded: room.stranded || {},
+      members: Array.isArray(room.members) ? room.members : [],
+      // Immutable room identity: without this, a room merged in via the
+      // remote-sync path (the only caller of this function) loses its
+      // roomId on the next cold hydrate and falls back to legacy
+      // name-keyed identity — same field updateGroupChat's inline map
+      // already carries.
+      roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+      image: room.image || null,
+      syncRevision: Math.max(0, Number(room.syncRevision || 0))
+    }
+  }
+
+  return durable
+}
+
+function persistGroupChatRooms(all = $groupChats.get()) {
+  try {
+    return Promise.resolve(pluginCtx?.storage?.set?.('group-chats', durableGroupChatRooms(all))).catch(() => undefined)
+  } catch {
+    return Promise.resolve()
+  }
+}
+
+function groupChatSyncConnectionId() {
+  return String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || '')
+}
+
+/** Route a sync job back to the gateway that was active when it was queued.
+ *  A foreground switch during debounce must not write the old snapshot into
+ *  the newly active gateway. */
+async function groupChatSyncRequest(job, method, params) {
+  if (job.connectionId && typeof host.profileRoutes === 'function' && typeof host.requestProfile === 'function') {
+    const routes = await host.profileRoutes()
+    const route = (Array.isArray(routes) ? routes : []).find(candidate => {
+      const profile = String(candidate?.targetProfile || candidate?.profile || '')
+      return String(candidate?.connectionId || '') === job.connectionId && profile === 'default'
+    })
+
+    if (route) {
+      return host.requestProfile(route, method, params)
+    }
+  }
+
+  const currentConnectionId = groupChatSyncConnectionId()
+  if (job.connectionId && currentConnectionId && job.connectionId !== currentConnectionId) {
+    throw new Error('Group chat gateway changed before sync')
+  }
+  return host.request(method, params)
+}
+
+async function groupChatRemoteSnapshot(job) {
+  const result = await groupChatSyncRequest(job, 'profiles.list', { include_sessions: false })
+  const profile = (Array.isArray(result?.profiles) ? result.profiles : []).find(row => row?.name === 'default')
+  const snapshot = profile?.ui_meta?.[GROUP_CHAT_SYNC_META_KEY]
+  const supportsCas = Boolean(profile && Object.prototype.hasOwnProperty.call(profile, 'ui_meta_revisions'))
+  return {
+    snapshot: snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) ? snapshot : null,
+    revision: Math.max(0, Number(profile?.ui_meta_revisions?.[GROUP_CHAT_SYNC_META_KEY] || 0)),
+    supportsCas
+  }
+}
+
+/** Pull the shared room projection into this Desktop before it publishes any
+ *  local state. This is the receive half of the client-only sync contract. */
+async function pullGroupChatServerState(connectionId = groupChatSyncConnectionId()) {
+  const { snapshot: remote } = await groupChatRemoteSnapshot({ connectionId })
+
+  if (!remote) {
+    return false
+  }
+  const pending = groupChatSyncPendingByConnection.get(String(connectionId || ''))
+  const merged = mergeRemoteGroupChatSnapshotIntoRooms(remote, $groupChats.get(), {
+    preserveRooms: pending?.changedRooms || [],
+    deletedRooms: pending?.deletedRooms || []
+  })
+  $groupChats.set(merged)
+  await persistGroupChatRooms(merged)
+  return true
+}
+
+function groupChatSyncBackoff(connectionId) {
+  const count = Number(groupChatSyncRetryCounts.get(connectionId) || 0)
+  return Math.min(30000, 1000 * 2 ** Math.min(count, 5))
+}
+
+function mergeGroupChatSyncJobs(existing, incoming) {
+  if (!existing || existing.connectionId !== incoming.connectionId) {
+    return incoming
+  }
+  return {
+    connectionId: incoming.connectionId,
+    allowEmpty: Boolean(existing.allowEmpty || incoming.allowEmpty),
+    changedRooms: [...new Set([...(existing.changedRooms || []), ...(incoming.changedRooms || [])])],
+    deletedRooms: [...new Set([...(existing.deletedRooms || []), ...(incoming.deletedRooms || [])])]
+  }
+}
+
+function groupChatSyncPayloadEqual(left, right) {
+  return (
+    JSON.stringify(left?.rooms || {}) === JSON.stringify(right?.rooms || {}) &&
+    JSON.stringify(left?.deleted || {}) === JSON.stringify(right?.deleted || {})
+  )
+}
+
+/** Every default-profile gateway route this Desktop can currently reach.
+ *  The projection fans out to ALL of them, so any single gateway can die or
+ *  be removed without losing the shared room state, and gateway-only
+ *  clients (Hermes Go, headless backends) see rooms regardless of which
+ *  gateway a Desktop was foregrounding when the room was used. */
+async function groupChatSyncTargetConnections() {
+  const targets = new Set()
+  const active = groupChatSyncConnectionId()
+  targets.add(String(active || ''))
+  if (typeof host.profileRoutes === 'function' && typeof host.requestProfile === 'function') {
+    try {
+      const routes = await host.profileRoutes()
+      for (const route of Array.isArray(routes) ? routes : []) {
+        const profile = String(route?.targetProfile || route?.profile || '')
+        const connectionId = String(route?.connectionId || '')
+        if (profile === 'default' && connectionId) {
+          targets.add(connectionId)
+        }
+      }
+    } catch {
+      // Route inventory unavailable — the active gateway alone still syncs.
+    }
+  }
+  return [...targets]
+}
+
+async function flushGroupChatServerSync(connectionId) {
+  if (connectionId === undefined) {
+    // Drain every connection with pending work.
+    for (const pendingId of [...groupChatSyncPendingByConnection.keys()]) {
+      void flushGroupChatServerSync(pendingId)
+    }
+    return
+  }
+  const id = String(connectionId || '')
+  if (groupChatSyncDisposed || groupChatSyncInFlightConnections.has(id) || !groupChatSyncPendingByConnection.has(id)) {
+    return
+  }
+  const job = groupChatSyncPendingByConnection.get(id)
+  groupChatSyncPendingByConnection.delete(id)
+  groupChatSyncInFlightConnections.add(id)
+
+  try {
+    const remoteState = await groupChatRemoteSnapshot(job)
+    const local = groupChatSyncSnapshot($groupChats.get())
+    const writeRevision = remoteState.revision + 1
+    const snapshot = mergeGroupChatSyncSnapshots(remoteState.snapshot, local, {
+      changedRooms: job.changedRooms,
+      deletedRooms: job.deletedRooms,
+      writeRevision
+    })
+
+    // Reconnect/startup reconciliation often discovers that the gateway
+    // already holds the exact merged projection. Avoid advancing a revision
+    // merely because a view reopened.
+    if (!(job.changedRooms || []).length && !(job.deletedRooms || []).length && groupChatSyncPayloadEqual(snapshot, remoteState.snapshot)) {
+      if (remoteState.snapshot) {
+        const pending = groupChatSyncPendingByConnection.get(id)
+        const mergedRooms = mergeRemoteGroupChatSnapshotIntoRooms(remoteState.snapshot, $groupChats.get(), {
+          preserveRooms: pending?.changedRooms || [],
+          deletedRooms: pending?.deletedRooms || []
+        })
+        $groupChats.set(mergedRooms)
+        await persistGroupChatRooms(mergedRooms)
+      }
+      groupChatSyncRetryCounts.delete(id)
+      return
+    }
+
+    const configureParams = {
+      name: 'default',
+      ui_meta: { [GROUP_CHAT_SYNC_META_KEY]: snapshot }
+    }
+    if (remoteState.supportsCas) {
+      configureParams.ui_meta_expected_revisions = { [GROUP_CHAT_SYNC_META_KEY]: remoteState.revision }
+    }
+    const result = await groupChatSyncRequest(job, 'profiles.configure', configureParams)
+
+    if (result?.applied?.ui_meta !== true) {
+      throw new Error('Gateway rejected group chat ui_meta')
+    }
+    if (
+      remoteState.supportsCas &&
+      Number(result?.applied?.ui_meta_revisions?.[GROUP_CHAT_SYNC_META_KEY] || 0) !== writeRevision
+    ) {
+      throw new Error('Gateway did not advance group chat ui_meta revision')
+    }
+
+    const confirmedState = await groupChatRemoteSnapshot(job)
+    if (remoteState.supportsCas && confirmedState.revision < writeRevision) {
+      throw new Error('Group chat ui_meta revision missing after read-back')
+    }
+    if (confirmedState.snapshot) {
+      const pending = groupChatSyncPendingByConnection.get(id)
+      const mergedRooms = mergeRemoteGroupChatSnapshotIntoRooms(confirmedState.snapshot, $groupChats.get(), {
+        preserveRooms: pending?.changedRooms || [],
+        deletedRooms: pending?.deletedRooms || []
+      })
+      $groupChats.set(mergedRooms)
+      await persistGroupChatRooms(mergedRooms)
+    }
+    groupChatSyncRetryCounts.delete(id)
+  } catch {
+    if (!groupChatSyncDisposed) {
+      const retries = Number(groupChatSyncRetryCounts.get(id) || 0) + 1
+      // A gateway that was REMOVED (not just flaky) has no route anymore and
+      // would otherwise retry forever. Give up after the backoff ladder tops
+      // out; local storage remains authoritative and a future reconnect of
+      // that gateway re-seeds it via the gateway-transition pull/publish.
+      if (retries > 8) {
+        groupChatSyncRetryCounts.delete(id)
+        return
+      }
+      groupChatSyncPendingByConnection.set(id, mergeGroupChatSyncJobs(groupChatSyncPendingByConnection.get(id), job))
+      groupChatSyncRetryCounts.set(id, retries)
+      if (typeof setTimeout === 'function' && !groupChatSyncRetryTimers.has(id)) {
+        groupChatSyncRetryTimers.set(id, setTimeout(() => {
+          groupChatSyncRetryTimers.delete(id)
+          void flushGroupChatServerSync(id)
+        }, groupChatSyncBackoff(id)))
+      }
+    }
+  } finally {
+    groupChatSyncInFlightConnections.delete(id)
+    if (groupChatSyncPendingByConnection.has(id) && !groupChatSyncRetryTimers.has(id) && !groupChatSyncDisposed) {
+      void flushGroupChatServerSync(id)
+    }
+  }
+}
+
+function stopGroupChatServerSync() {
+  groupChatSyncDisposed = true
+  groupChatSyncPendingByConnection.clear()
+  if (groupChatSyncTimer !== null) {
+    clearTimeout(groupChatSyncTimer)
+    groupChatSyncTimer = null
+  }
+  for (const timer of groupChatSyncRetryTimers.values()) {
+    clearTimeout(timer)
+  }
+  groupChatSyncRetryTimers.clear()
+  groupChatSyncRetryCounts.clear()
+}
+
+/** Debounced, pull-merge-write server mirror, fanned out to every reachable
+ *  default-profile gateway. Local storage keeps the complete orchestration
+ *  log; ui_meta is a bounded cross-client projection per gateway, each with
+ *  its own CAS revision stream. */
+function scheduleGroupChatServerSync(
+  all = $groupChats.get(),
+  { allowEmpty = false, changedRooms = [], deletedRooms = [] } = {}
+) {
+  // Browser shells provide timers; source-level VM tests and older embedded
+  // hosts may not. Room persistence must never break the surrounding gateway
+  // lifecycle when the optional mirror cannot be scheduled.
+  if (typeof setTimeout !== 'function') {
+    return
+  }
+  const snapshot = groupChatSyncSnapshot(all)
+  // A newly installed Desktop has no local room cache. Publishing that empty
+  // state on hydrate/reconnect would erase a valid mirror produced elsewhere.
+  // Only an explicit final-room disband is allowed to clear the projection.
+  if (Object.keys(snapshot.rooms).length === 0 && !allowEmpty) {
+    return
+  }
+  if (groupChatSyncTimer !== null) {
+    clearTimeout(groupChatSyncTimer)
+  }
+  // Queue on the ACTIVE gateway synchronously (tests and older hosts have no
+  // async route inventory), then widen to every reachable gateway before the
+  // debounce fires.
+  const activeId = String(groupChatSyncConnectionId() || '')
+  const queueFor = connectionId => {
+    const id = String(connectionId || '')
+    const retryTimer = groupChatSyncRetryTimers.get(id)
+    if (retryTimer !== undefined) {
+      clearTimeout(retryTimer)
+      groupChatSyncRetryTimers.delete(id)
+    }
+    groupChatSyncPendingByConnection.set(id, mergeGroupChatSyncJobs(groupChatSyncPendingByConnection.get(id), {
+      connectionId: id,
+      allowEmpty,
+      changedRooms,
+      deletedRooms
+    }))
+  }
+  queueFor(activeId)
+  groupChatSyncTimer = setTimeout(() => {
+    groupChatSyncTimer = null
+    void groupChatSyncTargetConnections()
+      .then(targets => {
+        for (const target of targets) {
+          if (String(target || '') !== activeId) {
+            queueFor(target)
+          }
+        }
+      })
+      .catch(() => undefined)
+      .then(() => flushGroupChatServerSync())
+  }, 350)
+}
 
 function handleSessionsGatewayTransition() {
-  $sessionsGatewayGeneration.set($sessionsGatewayGeneration.get() + 1)
-  $botSelectedSessions.set({})
   // A gateway swap invalidates any in-flight room drive: bump every room's
   // epoch so running loops bail at their next member boundary.
   const rooms = { ...$groupChats.get() }
@@ -198,20 +1183,320 @@ function handleSessionsGatewayTransition() {
   }
 
   $groupChats.set(rooms)
+  // Pull before re-publishing so a reconnect or source swap never lets this
+  // client's stale cache hide a room written by another Desktop/mobile client.
+  void pullGroupChatServerState()
+    .catch(() => false)
+    .then(() => scheduleGroupChatServerSync($groupChats.get()))
+}
+
+// ── cross-connection bot relay ────────────────────────────────────────────
+// Connections ARE the peer set: every gateway this Desktop holds a socket
+// to (local, remote URL, SSH, Hermes Cloud, docker) must be able to find
+// every other connection's agents and message them via message_agent. The
+// Desktop is the relay — it owns every socket. Two loops:
+//  - roster loop: pushes each gateway the union roster of agents on the
+//    OTHER connections (bot_relay.roster.sync), so message_agent resolves
+//    cross-connection targets and Bot Chat prompts list them;
+//  - drain loop: collects queued envelopes from every gateway
+//    (bot_relay.outbox.drain), delivers each on the target connection's
+//    own socket (bot_relay.deliver), and posts the reply back to the
+//    sender gateway (bot_relay.reply) where a waiter wakes the sender.
+// Older backends without the RPCs fail per-call and are skipped — the
+// relay degrades to whatever subset of connections supports it.
+const RELAY_ROSTER_INTERVAL_MS = 60_000
+const RELAY_DRAIN_INTERVAL_MS = 4_000
+let relayDisposed = false
+let relayRosterTimer = null
+let relayDrainTimer = null
+let relayRosterBusy = false
+let relayDrainBusy = false
+
+/** One representative route per reachable connection id. */
+async function relayConnections() {
+  if (typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
+    return []
+  }
+
+  try {
+    const routes = await host.profileRoutes()
+    const byConnection = new Map()
+
+    for (const route of Array.isArray(routes) ? routes : []) {
+      const id = String(route?.connectionId || '')
+
+      if (id && !byConnection.has(id)) {
+        byConnection.set(id, route)
+      }
+    }
+
+    return [...byConnection.entries()].map(([id, route]) => ({ id, route }))
+  } catch {
+    return []
+  }
+}
+
+/** The agents living on one connection, as relay roster rows. */
+async function relayAgentsOn(connection) {
+  try {
+    const res = await host.requestProfile(connection.route, 'profiles.list', { include_sessions: false })
+    const profiles = Array.isArray(res?.profiles) ? res.profiles : []
+    const label = String(
+      connection.route?.connectionLabel || connection.route?.label || connection.id
+    )
+
+    return profiles
+      .map(profile => ({
+        profile: String(profile?.name || ''),
+        handle: botHandle(profile?.name, profile),
+        connection_id: connection.id,
+        connection_label: label,
+        title: String(profile?.ui_meta?.['hermes-bots']?.title || profile?.display_name || ''),
+        description: String(profile?.description || '')
+      }))
+      .filter(row => row.profile)
+  } catch {
+    return []
+  }
+}
+
+/** Push every gateway the union roster of agents on the OTHER connections. */
+async function syncRelayRosters() {
+  if (relayDisposed || relayRosterBusy) {
+    return
+  }
+
+  relayRosterBusy = true
+
+  try {
+    const connections = await relayConnections()
+
+    if (connections.length < 2) {
+      return
+    }
+
+    const agentsByConnection = new Map()
+    await Promise.all(
+      connections.map(async connection => {
+        agentsByConnection.set(connection.id, await relayAgentsOn(connection))
+      })
+    )
+
+    await Promise.all(
+      connections.map(async connection => {
+        const others = []
+
+        for (const [id, agents] of agentsByConnection) {
+          if (id !== connection.id) {
+            others.push(...agents)
+          }
+        }
+
+        try {
+          await host.requestProfile(connection.route, 'bot_relay.roster.sync', { agents: others })
+        } catch {
+          // Older backend without the relay RPCs — skip this connection.
+        }
+      })
+    )
+  } finally {
+    relayRosterBusy = false
+  }
+}
+
+/** Drain every gateway's outbox and deliver each envelope on the target
+ *  connection's own socket; the reply (or error) is posted back to the
+ *  sender gateway for its waiter. */
+async function drainRelayOutboxes() {
+  if (relayDisposed || relayDrainBusy) {
+    return
+  }
+
+  relayDrainBusy = true
+
+  try {
+    const connections = await relayConnections()
+
+    if (connections.length < 2) {
+      return
+    }
+
+    const byId = new Map(connections.map(connection => [connection.id, connection]))
+
+    for (const sender of connections) {
+      let envelopes = []
+
+      try {
+        const res = await host.requestProfile(sender.route, 'bot_relay.outbox.drain', {})
+        envelopes = Array.isArray(res?.envelopes) ? res.envelopes : []
+      } catch {
+        continue
+      }
+
+      for (const envelope of envelopes) {
+        if (relayDisposed) {
+          return
+        }
+
+        const envelopeId = String(envelope?.id || '')
+        const target = byId.get(String(envelope?.target_connection || ''))
+        const postReply = async payload => {
+          try {
+            await host.requestProfile(sender.route, 'bot_relay.reply', { id: envelopeId, ...payload })
+          } catch {
+            // Sender gateway unreachable — its waiter times out with guidance.
+          }
+        }
+
+        if (!envelopeId) {
+          continue
+        }
+
+        if (!target) {
+          await postReply({ error: `connection '${envelope?.target_connection}' is not connected to this Desktop right now` })
+          continue
+        }
+
+        try {
+          const res = await host.requestProfile(target.route, 'bot_relay.deliver', {
+            profile: String(envelope?.target_profile || ''),
+            message: String(envelope?.message || '')
+          })
+          await postReply({ reply: String(res?.reply || '') })
+        } catch (error) {
+          await postReply({ error: String(error?.message || error || 'delivery failed') })
+        }
+      }
+    }
+  } finally {
+    relayDrainBusy = false
+  }
+}
+
+function startBotRelay() {
+  relayDisposed = false
+
+  // Source-shape test harnesses evaluate plugin.js without DOM timers —
+  // the relay only runs where a real event loop exists.
+  if (typeof setInterval !== 'function' || typeof clearInterval !== 'function') {
+    return
+  }
+
+  if (relayRosterTimer === null) {
+    relayRosterTimer = setInterval(() => void syncRelayRosters(), RELAY_ROSTER_INTERVAL_MS)
+    void syncRelayRosters()
+  }
+
+  if (relayDrainTimer === null) {
+    relayDrainTimer = setInterval(() => void drainRelayOutboxes(), RELAY_DRAIN_INTERVAL_MS)
+  }
+}
+
+function stopBotRelay() {
+  relayDisposed = true
+
+  if (relayRosterTimer !== null) {
+    clearInterval(relayRosterTimer)
+    relayRosterTimer = null
+  }
+
+  if (relayDrainTimer !== null) {
+    clearInterval(relayDrainTimer)
+    relayDrainTimer = null
+  }
 }
 
 /** Per-bot appearance + display meta, persisted via ctx.storage:
  *  { [botName]: { shape, color, title } } */
 const $botMeta = atom({})
 
-async function saveBotMeta(name, patch) {
-  const prevMeta = $botMeta.get()[name] || {}
-  const next = { ...$botMeta.get(), [name]: { ...prevMeta, ...patch } }
+function commitBotMetaV2(storage, snapshot) {
+  const commit = botMetaV2Commit.then(async () => {
+    if (typeof storage?.remove !== 'function' || typeof storage?.set !== 'function') {
+      throw new Error('bot metadata v2 storage is unavailable')
+    }
+
+    const [previousSnapshot, previousMarker] = typeof storage.get === 'function'
+      ? await Promise.all([
+          storage.get(BOT_META_V2_KEY),
+          storage.get(BOT_META_MIGRATION_KEY)
+        ])
+      : [null, null]
+    const hasCommittedPrevious = previousMarker === true &&
+      previousSnapshot &&
+      typeof previousSnapshot === 'object' &&
+      !Array.isArray(previousSnapshot)
+
+    try {
+      await storage.remove(BOT_META_MIGRATION_KEY)
+      await storage.set(BOT_META_V2_KEY, snapshot)
+      await storage.set(BOT_META_MIGRATION_KEY, true)
+    } catch (error) {
+      if (hasCommittedPrevious) {
+        try {
+          await storage.set(BOT_META_V2_KEY, previousSnapshot)
+          await storage.set(BOT_META_MIGRATION_KEY, true)
+        } catch {
+          await Promise.allSettled([
+            storage.remove(BOT_META_MIGRATION_KEY),
+            storage.remove(BOT_META_V2_KEY)
+          ])
+        }
+      } else {
+        await Promise.allSettled(
+          [BOT_META_MIGRATION_KEY, BOT_META_V2_KEY].map(key => storage.remove(key))
+        )
+      }
+      throw error
+    }
+  })
+
+  botMetaV2Commit = commit.catch(() => undefined)
+
+  return commit
+}
+
+function botOwner(owner) {
+  if (typeof owner === 'string') {
+    const name = owner.trim()
+    const route = migratedLocalRoutes.get(name)
+
+    return {
+      bot: route ? { name, sourceScoped: true, route } : { name },
+      name,
+      key: route ? botRouteKey(route) : name,
+      route: route || null
+    }
+  }
+
+  const name = String(owner?.name || '').trim()
+  const route = botConnectionRoute(owner)
+
+  return { bot: owner, name, key: route ? botRouteKey(route) : name, route }
+}
+
+/** Freshness fence for the server-meta overlay: a roster snapshot fetched
+ * before the latest local/server metadata write must not overwrite it. */
+const botMetaWriteAt = new Map()
+
+function noteBotMetaWrite(key) {
+  botMetaWriteAt.set(key, Date.now())
+}
+
+async function saveBotMeta(owner, patch) {
+  const { bot, key, name, route } = botOwner(owner)
+  const prevMeta = $botMeta.get()[key] || {}
+  const next = { ...$botMeta.get(), [key]: { ...prevMeta, ...patch } }
+  noteBotMetaWrite(key)
   $botMeta.set(next)
 
   // Local plugin storage: instant, and the fallback for older gateways.
+  let localPersistence = Promise.resolve()
   try {
-    Promise.resolve(pluginCtx?.storage?.set?.('bot-meta', next)).catch(() => undefined)
+    const persisted = route || botMetaV2Active
+      ? commitBotMetaV2(pluginCtx?.storage, next)
+      : Promise.resolve(pluginCtx?.storage?.set?.(BOT_META_V1_KEY, next))
+    localPersistence = persisted.catch(() => undefined)
   } catch {
     /* storage unavailable — look persists for this window only */
   }
@@ -226,8 +1511,10 @@ async function saveBotMeta(name, patch) {
   // the list call — so pfps follow the profile across machines too.
   let serverRequest = null
   try {
-    const { image, pet, ...rest } = next[name] || {}
-    serverRequest = Promise.resolve(host.request('profiles.configure', { name, ui_meta: { 'hermes-bots': rest } }))
+    const { image, pet, ...rest } = next[key] || {}
+    const request = route ? requestForBot(bot, 'profiles.configure', { name, ui_meta: { 'hermes-bots': rest } }) :
+      host.request('profiles.configure', { name, ui_meta: { 'hermes-bots': rest } })
+    serverRequest = Promise.resolve(request)
   } catch {
     /* older/unavailable gateway — the local fallback remains saved */
   }
@@ -241,8 +1528,12 @@ async function saveBotMeta(name, patch) {
   if ('image' in patch && patch.image !== (prevMeta.image ?? null)) {
     try {
       const req = patch.image
-        ? host.request('profiles.set_asset', { name, asset: 'avatar', data: patch.image })
-        : host.request('profiles.set_asset', { name, asset: 'avatar', clear: true })
+        ? (route
+            ? requestForBot(bot, 'profiles.set_asset', { name, asset: 'avatar', data: patch.image })
+            : host.request('profiles.set_asset', { name, asset: 'avatar', data: patch.image }))
+        : (route
+            ? requestForBot(bot, 'profiles.set_asset', { name, asset: 'avatar', clear: true })
+            : host.request('profiles.set_asset', { name, asset: 'avatar', clear: true }))
       req.catch(() => undefined)
     } catch {
       /* older gateway */
@@ -270,9 +1561,151 @@ async function saveBotMeta(name, patch) {
     } catch {
       /* older/unavailable gateway — the local fallback remains saved */
     }
+    // Re-stamp now that the server write settled: a roster snapshot fetched
+    // while profiles.configure was still in flight predates the new ui_meta
+    // just as surely as one fetched before the local write.
+    noteBotMetaWrite(key)
   }
 
+  await localPersistence
+
   return { serverPersisted: serverOutcome === 'persisted', serverOutcome }
+}
+
+/** Migrate name-keyed appearance state only when the live registry proves
+ * there is one local source. A v1 name cannot identify a machine in a
+ * multi-source desktop, so the conservative result there is to retain v1 as
+ * rollback data and leave remote rows unpainted. */
+function hydrateBotMeta(snapshot, remap = null) {
+  const next = { ...snapshot }
+
+  for (const [key, meta] of Object.entries($botMeta.get())) {
+    const target = remap?.get(key) || key
+    next[target] = { ...(next[target] || {}), ...meta }
+  }
+
+  $botMeta.set(next)
+
+  return next
+}
+
+async function migrateBotMeta(storage = pluginCtx?.storage) {
+  let v1 = null
+  let v2 = null
+  let v2Committed = false
+
+  try {
+    ;[v1, v2, v2Committed] = await Promise.all([
+      storage?.get?.(BOT_META_V1_KEY),
+      storage?.get?.(BOT_META_V2_KEY),
+      storage?.get?.(BOT_META_MIGRATION_KEY)
+    ])
+  } catch {
+    return false
+  }
+
+  if (v2Committed === true && v2 && typeof v2 === 'object' && !Array.isArray(v2)) {
+    hydrateBotMeta(v2)
+    botMetaV2Active = true
+
+    return true
+  }
+
+  if (!v1 || typeof v1 !== 'object' || Array.isArray(v1) || typeof host.agents !== 'function') {
+    if (v1 && typeof v1 === 'object' && !Array.isArray(v1)) {
+      hydrateBotMeta(v1)
+    }
+
+    return false
+  }
+
+  let union
+  let routes
+
+  try {
+    union = await host.agents()
+    routes = typeof host.profileRoutes === 'function' ? await host.profileRoutes() : []
+  } catch {
+    hydrateBotMeta(v1)
+
+    return false
+  }
+
+  const sources = Array.isArray(union?.sources) ? union.sources : []
+  const localAgents = (union?.agents || []).filter(agent => agent?.connectionKind === 'local')
+  const soleLocal = sources.length === 1
+    ? sources[0]?.kind === 'local'
+    : sources.length === 0 && localAgents.length > 0 && (union?.agents || []).every(agent => agent?.connectionKind === 'local')
+
+  if (!soleLocal) {
+    hydrateBotMeta(v1)
+
+    return false
+  }
+
+  const migrated = {}
+  const pendingLocalRoutes = new Map()
+
+  for (const [name, meta] of Object.entries(v1)) {
+    const route = (routes || []).find(candidate => candidate?.mode === 'local' && candidate?.profile === name) ||
+      (() => {
+        const agent = localAgents.find(candidate => candidate.profile === name)
+
+        return agent
+          ? {
+              connectionId: agent.connectionId,
+              mode: 'local',
+              profile: name,
+              targetProfile: agent.targetProfile || name
+            }
+          : null
+      })()
+
+    if (!route?.connectionId) {
+      // A missing route makes the topology proof unusable for this key. Keep
+      // the v1 record intact rather than guessing a local/remote projection.
+      hydrateBotMeta(v1)
+
+      return false
+    }
+
+    const captured = {
+      connectionId: route.connectionId,
+      mode: 'local',
+      profile: name,
+      targetProfile: route.targetProfile || name
+    }
+    migrated[botRouteKey(captured)] = meta
+    pendingLocalRoutes.set(name, captured)
+  }
+
+  const remap = new Map(
+    [...pendingLocalRoutes].map(([name, route]) => [name, botRouteKey(route)])
+  )
+  const hydrated = { ...migrated }
+
+  for (const [key, meta] of Object.entries($botMeta.get())) {
+    const target = remap.get(key) || key
+    hydrated[target] = { ...(hydrated[target] || {}), ...meta }
+  }
+
+  try {
+    await commitBotMetaV2(storage, hydrated)
+  } catch {
+    botMetaV2Active = false
+    hydrateBotMeta(v1)
+
+    return false
+  }
+
+  migratedLocalRoutes.clear()
+  for (const [name, route] of pendingLocalRoutes) {
+    migratedLocalRoutes.set(name, route)
+  }
+  hydrateBotMeta(hydrated)
+  botMetaV2Active = true
+
+  return true
 }
 
 // ── hidden bots (right-click → Hide Bot) ────────────────────────────────────
@@ -308,38 +1741,73 @@ function fallbackSelectionAfterHide(name) {
   const meta = $botMeta.get()
   const visible = $lastRoster
     .get()
-    .filter(bot => !bot.remoteSource && bot.name !== name && !meta[bot.name]?.hidden)
+    .filter(bot => botSelectionKey(bot) !== name && !botRosterMeta(bot, meta)?.hidden)
 
   if (visible.length) {
-    $selectedBot.set(visible[0].name)
+    $selectedBot.set(botSelectionKey(visible[0]))
     return
   }
 
-  if (name !== 'default' && !meta.default?.hidden) {
+  const defaultBot = $lastRoster.get().find(bot => isDefaultBot(bot) && !botRosterMeta(bot, meta)?.hidden)
+  if (defaultBot && botSelectionKey(defaultBot) !== name) {
+    $selectedBot.set(botSelectionKey(defaultBot))
+  } else if (!$lastRoster.get().some(isDefaultBot)) {
+    // Legacy sole-local rosters can transiently omit the default row. Keep the
+    // historic fallback rather than leaving Routines attached to a hidden bot.
     $selectedBot.set('default')
   }
 }
 
 /** One-time reconciliation: Bot Mode sessions are always hidden, but rooms
  *  and Bot Chats created before this policy (or while the old pref was off)
- *  left visible rows behind. On every plugin load, sweep every session id we
- *  own — canonical chats from bot meta plus each group room's member
- *  sessions — through the core session.set_hidden RPC, then run the
- *  ownership-based sweep for the rows we DON'T know by id. Idempotent (the DB
- *  setter is a no-op on already-hidden rows) and feature-detected: older
- *  gateways lack session.set_hidden and simply keep the rows visible. */
+ *  left visible rows behind. On every plugin load, sweep the session ids we
+ *  own by id (each group room's member sessions) through the core
+ *  session.set_hidden RPC, then run the TITLE-based ownership sweep for
+ *  everything else — canonical Bot Chats are identified by name (the
+ *  registry row titled "Bot Chat"), so the title sweep is what hides them;
+ *  no stored-id pointer is consulted. Idempotent (the DB setter is a no-op
+ *  on already-hidden rows) and feature-detected: older gateways lack
+ *  session.set_hidden and simply keep the rows visible. */
 function hideOwnedBotSessions() {
-  const canonical = Object.values($botMeta.get())
-    .map(m => m && m.chat)
-    .filter(Boolean)
-  const rooms = Object.values($groupChats.get())
-    .flatMap(room => Object.values(room?.sessions || {}))
-    .filter(sid => Boolean(sid) && sid !== true)
-  const ids = [...new Set([...canonical, ...rooms])]
+  const roomEntries = Object.values($groupChats.get()).flatMap(room =>
+    Object.entries(room?.sessions || {})
+      .map(([key, id]) => {
+        if (!id || id === true) {
+          return null
+        }
+
+        const persisted = room?.sessionOwners?.[key]
+        const derived = (room?.members || []).find(member => groupMemberKey(member) === key)
+        // Bare keys are legacy local rooms. A source-qualified key without its
+        // immutable owner is unsafe: never let it fall through ambient routing.
+        const owner = persisted || derived || (!key.includes('::') ? { name: key } : null)
+
+        if (key.includes('::')) {
+          const route = owner?.route
+          const sourceMarked = owner?.sourceScoped || owner?.remoteSource
+          const routeKey = route?.connectionId && route?.profile
+            ? `${route.connectionId}::${route.profile}`
+            : ''
+
+          if (!sourceMarked || !route?.targetProfile || routeKey !== key) {
+            return null
+          }
+        }
+
+        return owner ? { owner, id, dedupe: `${key}\u0000${id}` } : null
+      })
+      .filter(Boolean)
+  )
+
+  // The same member session can appear in several rooms (and legacy rooms can
+  // share ids) — hide each (owner, id) pair exactly once.
+  const rooms = [...new Map(roomEntries.map(entry => [entry.dedupe, entry])).values()]
 
   const known = Promise.all(
-    ids.map(sid =>
-      Promise.resolve(host.request('session.set_hidden', { session_id: sid, hidden: true })).catch(() => undefined)
+    rooms.map(({ owner, id }) =>
+      Promise.resolve(requestForBot(owner, 'session.set_hidden', { session_id: id, hidden: true })).catch(
+        () => undefined
+      )
     )
   )
 
@@ -381,7 +1849,12 @@ async function sweepBotProfileSessions() {
     // back to the active gateway's own profile list (local bots; remote
     // sources get covered by the next sweep once the roster cache exists).
     try {
-      const res = await host.request('profiles.list', {})
+      const route = await activeBotRoute()
+      const res = await requestForBot(
+        route ? { name: route.profile, sourceScoped: true, route } : { name: 'default' },
+        'profiles.list',
+        {}
+      )
       roster = Array.isArray(res?.profiles) ? res.profiles : []
     } catch {
       return
@@ -427,18 +1900,22 @@ const avatarPushInflight = new Set()
  *  cross-machine roster art, so local-only images are a bug, not a state. */
 function pushLocalAvatars(roster) {
   for (const bot of roster) {
-    if (bot.has_avatar || avatarPushInflight.has(bot.name)) {
+    const key = botMetaKey(bot)
+
+    if (bot.has_avatar || avatarPushInflight.has(key)) {
       continue
     }
 
-    const image = $botMeta.get()[bot.name]?.image
+    const image = $botMeta.get()[key]?.image
 
     if (image && typeof image === 'string' && image.startsWith('data:')) {
-      avatarPushInflight.add(bot.name)
-      host
-        .request('profiles.set_asset', { name: bot.name, asset: 'avatar', data: image })
+      avatarPushInflight.add(key)
+      const request = bot.sourceScoped
+        ? requestForBot(bot, 'profiles.set_asset', { name: bot.name, asset: 'avatar', data: image })
+        : host.request('profiles.set_asset', { name: bot.name, asset: 'avatar', data: image })
+      Promise.resolve(request)
         .then(() => queryClient.invalidateQueries({ queryKey: ['hermes-bots', 'roster'] }))
-        .catch(() => avatarPushInflight.delete(bot.name))
+        .catch(() => avatarPushInflight.delete(key))
       continue
     }
 
@@ -451,16 +1928,17 @@ function pushLocalAvatars(roster) {
       continue
     }
 
-    avatarPushInflight.add(bot.name)
+    avatarPushInflight.add(key)
     rasterizeSvgToPng(svg, 160)
       .then(png =>
         png
-          ? host
-              .request('profiles.set_asset', { name: bot.name, asset: 'avatar', data: png })
+          ? (bot.sourceScoped
+              ? requestForBot(bot, 'profiles.set_asset', { name: bot.name, asset: 'avatar', data: png })
+              : host.request('profiles.set_asset', { name: bot.name, asset: 'avatar', data: png }))
               .then(() => queryClient.invalidateQueries({ queryKey: ['hermes-bots', 'roster'] }))
           : Promise.reject(new Error('rasterize failed'))
       )
-      .catch(() => avatarPushInflight.delete(bot.name))
+      .catch(() => avatarPushInflight.delete(key))
   }
 }
 
@@ -519,37 +1997,36 @@ function pullServerAvatars(roster) {
   pushLocalAvatars(roster)
 
   for (const bot of roster) {
-    if (!bot.has_avatar || avatarFetchInflight.has(bot.name)) {
+    const key = botMetaKey(bot)
+
+    if (!bot.has_avatar || avatarFetchInflight.has(key)) {
       continue
     }
 
-    if ($botMeta.get()[bot.name]?.image) {
+    if ($botMeta.get()[key]?.image) {
       continue
     }
 
-    avatarFetchInflight.add(bot.name)
-    host
-      .request('profiles.get_asset', { name: bot.name, asset: 'avatar' })
+    avatarFetchInflight.add(key)
+    const assetRequest = bot.sourceScoped
+      ? requestForBot(bot, 'profiles.get_asset', { name: bot.name, asset: 'avatar' })
+      : host.request('profiles.get_asset', { name: bot.name, asset: 'avatar' })
+    Promise.resolve(assetRequest)
       .then(res => {
         if (res?.found && res.data) {
           const current = $botMeta.get()
-          const mine = current[bot.name] || {}
+          const mine = current[key] || {}
           // A 160px raster of the vector face is only for inter-agent
           // notices. Do not park it on the roster or the live face dies.
           if (isBackfilledFacePng(res.data) && mine.imageKind !== 'photo' && !mine.pet) {
             return
           }
-          $botMeta.set({ ...current, [bot.name]: { ...mine, image: res.data } })
-
-          try {
-            Promise.resolve(pluginCtx?.storage?.set?.('bot-meta', $botMeta.get())).catch(() => undefined)
-          } catch {
-            /* no storage */
-          }
+          $botMeta.set({ ...current, [key]: { ...mine, image: res.data } })
+          persistBotMetaSnapshot($botMeta.get(), Boolean(bot.sourceScoped))
         }
       })
       .catch(() => undefined)
-      .finally(() => avatarFetchInflight.delete(bot.name))
+      .finally(() => avatarFetchInflight.delete(key))
   }
 }
 
@@ -558,8 +2035,16 @@ function pullServerAvatars(roster) {
  *  pet icon) are PRESERVED — the server copy never includes them, so a
  *  naive replace would wipe a just-saved image avatar on the next roster
  *  paint. When server bot metadata exists, an omitted chat is authoritative
- *  deletion; local still fills all gaps for older gateways with no metadata. */
-function mergeServerMeta(roster) {
+ *  deletion; local still fills all gaps for older gateways with no metadata.
+ *
+ *  `fetchedAt` (the snapshot's issue time) fences the overlay: a bot whose
+ *  local meta was written AFTER the snapshot was fetched is skipped — that
+ *  snapshot's ui_meta predates the write, and spreading it back over local
+ *  meta resurrects state the user just changed (a disbanded group's
+ *  membership reappearing as an empty roster row, a rename reverting, an
+ *  unpin undoing). The next roster fetch post-dates the write and overlays
+ *  normally, so server truth still gets the last word. */
+function mergeServerMeta(roster, fetchedAt = 0) {
   const local = $botMeta.get()
   let changed = false
   const next = { ...local }
@@ -567,7 +2052,11 @@ function mergeServerMeta(roster) {
   for (const bot of roster) {
     const server = bot.ui_meta?.['hermes-bots']
     if (server && typeof server === 'object') {
-      const mine = next[bot.name] || {}
+      const key = botMetaKey(bot)
+      if (fetchedAt && fetchedAt < (botMetaWriteAt.get(key) || 0)) {
+        continue
+      }
+      const mine = next[key] || {}
       const merged = { ...mine, ...server }
 
       // Local-only fields survive the server overlay.
@@ -575,15 +2064,10 @@ function mergeServerMeta(roster) {
         merged.image = mine.image
       }
 
-      // Server metadata is authoritative for the canonical chat pointer.
-      // Without this deletion sync, ctx.storage resurrects stale sessions
-      // after the server pin is cleared and even after a full app restart.
-      if (
-        Object.prototype.hasOwnProperty.call(mine, 'chat') &&
-        !Object.prototype.hasOwnProperty.call(server, 'chat')
-      ) {
-        delete merged.chat
-      }
+      // Legacy canonical-chat pointers (meta.chat) are dead: identity is the
+      // profile's "Bot Chat" registry row, resolved by name. Drop the key on
+      // sight so old ui_meta can never look meaningful again.
+      delete merged.chat
 
       // Canonical multi-group metadata is authoritative for the compatibility
       // scalar too. A server-side `group: null` is represented by omission,
@@ -597,8 +2081,8 @@ function mergeServerMeta(roster) {
         delete merged.group
       }
 
-      if (JSON.stringify(next[bot.name] || null) !== JSON.stringify(merged)) {
-        next[bot.name] = merged
+      if (JSON.stringify(next[key] || null) !== JSON.stringify(merged)) {
+        next[key] = merged
         changed = true
       }
     }
@@ -610,7 +2094,7 @@ function mergeServerMeta(roster) {
     // Persist server reconciliation so a relaunch cannot rehydrate stale
     // local fields that the server intentionally removed.
     try {
-      Promise.resolve(pluginCtx?.storage?.set?.('bot-meta', next)).catch(() => undefined)
+      persistBotMetaSnapshot(next, roster.some(bot => bot.sourceScoped))
     } catch {
       /* storage unavailable — reconciliation lasts for this window only */
     }
@@ -620,7 +2104,10 @@ function mergeServerMeta(roster) {
 /** Clone a bot: profile (config/skills/SOUL/memory via clone_from) + look.
  *  Name is "<base>-2", "-3", … — first free slot against the live roster. */
 async function duplicateBot(bot, roster) {
+  await ensureBotMetadata(bot)
   const base = bot.name
+  const ownerRoute = botConnectionRoute(bot)
+  const ownerKey = ownerRoute ? botRouteKey(ownerRoute) : null
   let name = null
   for (let n = 2; n < 100; n++) {
     // Truncate the BASE, never the suffix — slicing the joined string chops
@@ -628,7 +2115,7 @@ async function duplicateBot(bot, roster) {
     // base forever (#19).
     const suffix = `-${n}`
     const candidate = base.slice(0, 64 - suffix.length) + suffix
-    if (!roster.some(b => b.name === candidate)) {
+    if (!roster.some(b => b.name === candidate && (!ownerKey || botMetaKey(b)?.startsWith(`${ownerRoute.connectionId}::`)))) {
       name = candidate
       break
     }
@@ -638,7 +2125,7 @@ async function duplicateBot(bot, roster) {
     throw new Error('No free name for the duplicate.')
   }
 
-  await host.request('profiles.create', {
+  await requestForBot(bot, 'profiles.create', {
     name,
     clone_from: base,
     description: bot.description || ''
@@ -647,10 +2134,10 @@ async function duplicateBot(bot, roster) {
   // Same look: avatar shape/color/image and a "(copy)" title so the two
   // are tellable apart in the roster until the user renames. Do not copy
   // chat or created. Those belong to the original bot.
-  const meta = $botMeta.get()[base]
+  const meta = $botMeta.get()[botMetaKey(bot)]
   if (meta) {
     const { chat, created, ...look } = meta
-    saveBotMeta(name, {
+    await saveBotMeta({ ...bot, name, route: ownerRoute, sourceScoped: Boolean(ownerRoute) }, {
       ...look,
       title: meta.title ? `${meta.title} (copy)` : ''
     })
@@ -671,10 +2158,24 @@ async function duplicateBot(bot, roster) {
  * renderer's socket reconnect respawns it mid-delete, resurrecting the
  * directory (hermes-agent#52279). That is the "can't delete a bot" error. */
 async function deleteBot(bot) {
+  const route = botConnectionRoute(bot)
+
+  if (isDefaultBot(bot) || String(route?.targetProfile || '').toLowerCase() === 'default') {
+    throw new Error('The default profile cannot be deleted.')
+  }
+
   if (typeof host.deleteProfile === 'function') {
-    await host.deleteProfile(bot.name)
+    if (route) {
+      await host.deleteProfile(route)
+    } else {
+      await host.deleteProfile(bot.name)
+    }
   } else {
-    // Older desktop without the SDK verb — best effort via the CLI.
+    // Older desktop without the SDK verb — source-scoped rows fail closed.
+    if (route) {
+      throw new Error('Source-scoped profile deletion requires host.deleteProfile.')
+    }
+
     const result = await host.request('cli.exec', {
       argv: ['profile', 'delete', bot.name, '--yes']
     })
@@ -685,29 +2186,38 @@ async function deleteBot(bot) {
   }
 
   const meta = { ...$botMeta.get() }
-  delete meta[bot.name]
+  delete meta[botMetaKey(bot)]
   $botMeta.set(meta)
 
   try {
-    await Promise.resolve(pluginCtx?.storage?.set?.('bot-meta', meta))
+    if (route) {
+      await commitBotMetaV2(pluginCtx?.storage, meta)
+    } else {
+      await Promise.resolve(pluginCtx?.storage?.set?.(BOT_META_V1_KEY, meta))
+    }
   } catch {
     /* profile is deleted; stale local appearance is harmless if storage fails */
   }
 
   const unread = { ...$botUnread.get() }
-  delete unread[bot.name]
+  delete unread[botSelectionKey(bot)]
   $botUnread.set(unread)
-  rosterWatermarks.delete(bot.name)
-  avatarFetchInflight.delete(bot.name)
-  avatarPushInflight.delete(bot.name)
+  rosterWatermarks.delete(botSelectionKey(bot))
+  avatarFetchInflight.delete(botMetaKey(bot))
+  avatarPushInflight.delete(botMetaKey(bot))
 
-  if ($selectedBot.get() === bot.name) {
+  if ($selectedBot.get() === botSelectionKey(bot)) {
     $selectedBot.set('default')
   }
 
   queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
 
-  if (host.state.profile.get?.() === bot.name && typeof host.newChat === 'function') {
+  const activeOwner = focusedRosterOwner($focusedBotOwner.get?.())
+  const deletedOwnerIsActive = route
+    ? activeOwner?.connectionId === route.connectionId && activeOwner?.name === route.profile
+    : activeOwner?.name === bot.name
+
+  if (deletedOwnerIsActive && typeof host.newChat === 'function') {
     host.newChat('default')
   }
 }
@@ -825,6 +2335,66 @@ function defaultShapeFor(name) {
     hash = (hash * 31 + ch.charCodeAt(0)) >>> 0
   }
   return AVATAR_SHAPES[hash % AVATAR_SHAPES.length]
+}
+
+// ── blobatar shapes mode (default for new agents) ───────────────────────────
+// Deterministic soft-body faces drawn from a string. Shape strings:
+//   'blobatar'                — the face follows the bot's NAME (renaming the
+//                               bot re-rolls the face, live in the dialog)
+//   'blobatar:<seed>'         — seed locked (the 🔒 lock / 🎲 randomize picks)
+//   'blobatar:<seed>:<kind>'  — plus one of the ten silhouettes pinned
+//   'blobatar::<kind>'        — silhouette pinned, seed still follows the name
+// Bot names are slugs (NAME_RE) and generated seeds are base36, so ':' never
+// appears inside a segment. Colors come from the library's own name-derived
+// palette (contrast-guaranteed) — the classic color swatches don't apply.
+
+const BLOB_KINDS = ['round', 'organic', 'boxy', 'capsule', 'nub', 'cloud', 'droplet', 'hexagon', 'sun', 'triangle']
+
+// Trait positions at the center of each silhouette band. Band thresholds are
+// frozen per blobatar major (gen2: 0.22 / 0.48 / 0.60 / 0.70 / 0.79 / 0.86 /
+// 0.915 / 0.95 / 0.98).
+const BLOB_KIND_TRAIT = {
+  round: 0.11, organic: 0.35, boxy: 0.54, capsule: 0.65, nub: 0.745,
+  cloud: 0.825, droplet: 0.8875, hexagon: 0.9325, sun: 0.965, triangle: 0.99
+}
+
+function isBlobShape(shape) {
+  return shape === 'blobatar' || (typeof shape === 'string' && shape.startsWith('blobatar:'))
+}
+
+function parseBlobShape(shape, name) {
+  const parts = typeof shape === 'string' ? shape.split(':') : []
+  const seedPart = parts[1] || ''
+  const kind = BLOB_KINDS.includes(parts[2]) ? parts[2] : ''
+  return { seed: seedPart || name || 'agent', seedPart, kind }
+}
+
+function blobShapeString(seedPart, kind) {
+  if (kind) {
+    return `blobatar:${seedPart}:${kind}`
+  }
+  return seedPart ? `blobatar:${seedPart}` : 'blobatar'
+}
+
+/** Static SVG markup for a blob face, tagged data-bot-face so the roster's
+ *  PNG backfill (pushLocalAvatars → rasterizeSvgToPng) still finds it. */
+function blobMarkup(shape, name, size) {
+  if (!blobatarSvg) {
+    return null
+  }
+
+  const { seed, kind } = parseBlobShape(shape, name)
+  const opts = { size }
+
+  if (kind) {
+    opts.traits = { shape: BLOB_KIND_TRAIT[kind] }
+  }
+
+  try {
+    return blobatarSvg(seed, opts).replace('<svg ', '<svg data-bot-face=' + JSON.stringify(name) + ' ')
+  } catch {
+    return null
+  }
 }
 
 /** The colored body of the avatar (no eyes). Platonic solids are a filled
@@ -1440,6 +3010,26 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
     })
   }
 
+  // Blobatar shapes: the library draws the whole face (body + eyes + its own
+  // name-derived palette). Inline SVG via innerHTML so the roster PNG
+  // backfill's `svg[data-bot-face=…]` query still finds it; the math clock
+  // ignores it (no data-hb-math). Falls back to the legacy math face when the
+  // SDK predates the export.
+  if (isBlobShape(shape)) {
+    const markup = blobMarkup(shape, name, size)
+
+    if (markup) {
+      return jsx('span', {
+        'aria-hidden': true,
+        style: { width: size, height: size, display: 'block', lineHeight: 0 },
+        dangerouslySetInnerHTML: { __html: markup }
+      })
+    }
+
+    // Older SDK without blobatar: legacy deterministic shape from the name.
+    shape = defaultShapeFor(name)
+  }
+
   // Sigils are line art (no filled body) — the math clock rebuilds filled
   // outlines, which would turn a stored sigil pick into a blank circle.
   // Keep the legacy static render for them so old picks still draw.
@@ -1843,6 +3433,102 @@ function pickImageFromDevice() {
   })
 }
 
+// ── group-chat attachments: pick/paste/drop files the room's members see ────
+
+/** Classify a picked file for the group-attachment pipeline. */
+function groupAttachmentKind(file) {
+  if (/^image\//.test(file.type || '')) {
+    return 'image'
+  }
+
+  if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name || '')) {
+    return 'pdf'
+  }
+
+  return 'file'
+}
+
+/** File objects → [{ name, data, kind }] (data URLs), oversized files skipped
+ *  with a toast. Images are downscaled; PDFs and other files ride as raw data
+ *  URLs for the gateway's pdf.attach / file.attach staging. Shared by the
+ *  picker button, the composer paste handler, and room drag & drop. */
+async function filesToGroupAttachments(files) {
+  const picked = []
+
+  for (const file of [...(files || [])]) {
+    if (!file) {
+      continue
+    }
+
+    if (file.size > 15_000_000) {
+      host.notify({ kind: 'error', message: `${file.name || 'attachment'}: too large (max 15MB).` })
+      continue
+    }
+
+    const data = await new Promise(done => {
+      const reader = new FileReader()
+      reader.onload = () => done(typeof reader.result === 'string' ? reader.result : null)
+      reader.onerror = () => done(null)
+      reader.readAsDataURL(file)
+    })
+
+    if (!data) {
+      continue
+    }
+
+    const kind = groupAttachmentKind(file)
+    picked.push({
+      name: file.name || (kind === 'image' ? 'pasted image' : 'attachment'),
+      data: kind === 'image' ? await normalizeGroupAttachment(data) : data,
+      kind
+    })
+  }
+
+  return picked
+}
+
+/** Multi-file picker for the group composer — any file type; kind decides
+ *  the staging RPC. Resolves to [{ name, data, kind }]. */
+function pickGroupAttachments() {
+  return new Promise(resolve => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.multiple = true
+    input.onchange = () => resolve(filesToGroupAttachments(input.files))
+    input.click()
+  })
+}
+
+/** Bound a group attachment's long edge so room logs (persisted with the
+ *  plugin's other durable state) stay light while screenshots keep enough
+ *  resolution for vision models to read text. No-op for small images or
+ *  anything the canvas can't decode. */
+function normalizeGroupAttachment(dataUrl, maxEdge = 1568) {
+  return new Promise(resolve => {
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const long = Math.max(img.width, img.height)
+
+        if (!long || long <= maxEdge) {
+          return resolve(dataUrl)
+        }
+
+        const scale = maxEdge / long
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.max(1, Math.round(img.width * scale))
+        canvas.height = Math.max(1, Math.round(img.height * scale))
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
+        resolve(canvas.toDataURL('image/png'))
+      } catch {
+        resolve(dataUrl)
+      }
+    }
+    img.onerror = () => resolve(dataUrl)
+    img.src = dataUrl
+  })
+}
+
 /** Cached probe: does the gateway have an image backend? A `false` answer
  *  is re-checked on every dialog open — the gateway may have been restarted
  *  (picking up image.generate) or a backend enabled since the last probe.
@@ -1989,7 +3675,88 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
         : null,
 
       tab === 'bot'
-        ? jsxs('div', {
+        ? isBlobShape(shape) && blobatarSvg
+          ? (() => {
+              const { seedPart, kind } = parseBlobShape(shape, pickerName)
+              const locked = Boolean(seedPart)
+              return jsxs('div', {
+                className: 'grid justify-items-center gap-3',
+                children: [
+                  // Silhouette pins: Auto (name decides) + the six blob kinds.
+                  jsx('div', {
+                    style: {
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+                      gap: '6px',
+                      justifyItems: 'center'
+                    },
+                    children: ['', ...BLOB_KINDS].map(k =>
+                      jsx(
+                        'button',
+                        {
+                          type: 'button',
+                          title: k || 'Auto — the name decides',
+                          className: cn(
+                            'flex items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover)',
+                            k === kind && !image && 'ring-1 ring-(--ui-accent)'
+                          ),
+                          style: { width: 44, height: 44 },
+                          onClick: () => {
+                            onImage(null)
+                            onShape(blobShapeString(seedPart, k))
+                          },
+                          children: k
+                            ? jsx(BotFace, { shape: blobShapeString(seedPart, k), color, size: 32, name: pickerName })
+                            : jsx('span', { className: 'text-[0.6rem] text-(--ui-text-tertiary)', children: 'Auto' })
+                        },
+                        k || 'auto'
+                      )
+                    )
+                  }),
+                  jsxs('div', {
+                    className: 'flex items-center gap-1',
+                    children: [
+                      jsxs(Button, {
+                        type: 'button',
+                        variant: 'ghost',
+                        size: 'sm',
+                        onClick: () => {
+                          onImage(null)
+                          onShape(blobShapeString(Math.random().toString(36).slice(2, 10), kind))
+                        },
+                        children: [jsx(Codicon, { name: 'refresh', className: 'mr-1 text-[0.8rem]' }), 'Randomize']
+                      }),
+                      jsxs(Button, {
+                        type: 'button',
+                        variant: 'ghost',
+                        size: 'sm',
+                        title: locked
+                          ? 'Unlock — the face follows the agent\u2019s name again'
+                          : 'Keep this exact face even if the name changes',
+                        onClick: () => onShape(blobShapeString(locked ? '' : pickerName, kind)),
+                        children: [
+                          jsx(Codicon, { name: locked ? 'unlock' : 'lock', className: 'mr-1 text-[0.8rem]' }),
+                          locked ? 'Unlock' : 'Lock face'
+                        ]
+                      })
+                    ]
+                  }),
+                  jsx('div', {
+                    className: 'text-center text-[0.65rem] text-(--ui-text-quaternary)',
+                    children: locked ? 'Face locked — renaming won\u2019t change it.' : 'Face follows the name.'
+                  }),
+                  jsx(Button, {
+                    type: 'button',
+                    variant: 'ghost',
+                    size: 'sm',
+                    className: 'text-(--ui-text-tertiary)',
+                    onClick: () => onShape(defaultShapeFor(pickerName)),
+                    children: 'Classic shapes'
+                  })
+                ]
+              })
+            })()
+          : jsxs('div', {
             className: 'grid justify-items-center gap-3',
             children: [
               jsx('div', {
@@ -1999,11 +3766,12 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                   gap: '6px',
                   justifyItems: 'center'
                 },
-                children: AVATAR_PICKER_SHAPES.map(s =>
+                children: (blobatarSvg ? ['blobatar', ...AVATAR_PICKER_SHAPES] : AVATAR_PICKER_SHAPES).map(s =>
                   jsx(
                     'button',
                     {
                       type: 'button',
+                      title: s === 'blobatar' ? 'Blob face — drawn from the agent\u2019s name' : undefined,
                       className: cn(
                         'flex items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover)',
                         s === shape && !image && 'ring-1 ring-(--ui-accent)'
@@ -2336,34 +4104,38 @@ function PetTab({ image, onImage }) {
  *  Gates every SOUL.md protocol append below. */
 let serverInjectsProtocol = false
 
-/** Pins to resolve precisely on the next roster poll: {profile: chatId}.
- *  The backend answers "what about THIS conversation" per entry
- *  (preferred_session), so a row's preview can describe the same session its
- *  click opens (hermes-agent#88200). Unknown params are ignored by older
- *  gateways, which simply omit the field. */
-function preferredSessionIds(allMeta) {
-  const pins = {}
-  for (const [name, meta] of Object.entries(allMeta || {})) {
-    if (meta?.chat) {
-      pins[name] = meta.chat
-    }
-  }
-  return pins
-}
-
 function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
 
   return useQuery({
     queryKey: [...ROSTER_KEY, activeConnectionId],
     queryFn: async () => {
-      // Rich rows (last_session, ui_meta, has_avatar) come from the ACTIVE
-      // gateway's profiles.list — unchanged single-source behavior.
-      const pins = preferredSessionIds($botMeta.get())
-      const local = await host.request(
-        'profiles.list',
-        Object.keys(pins).length ? { preferred_session_ids: pins } : {}
-      )
+      // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
+      // against each bot's last local meta write, and a fetch issued before
+      // a write can only carry pre-write ui_meta. (Issue time is the
+      // conservative bound — the server answered no earlier than this.)
+      const issuedAt = Date.now()
+      // Rich rows (last_session, canonical_session, ui_meta, has_avatar)
+      // come from the ACTIVE gateway's profiles.list — the canonical Bot
+      // Chat is resolved server-side by NAME (the "Bot Chat" registry row),
+      // so the roster never sends session pointers.
+      const route = await activeBotRoute()
+      // Refresh the alias identity index alongside the roster: alias routes
+      // (Desktop profile → remote backend root) are what let a backend row
+      // keep its configured friendly identity after activation (#89131).
+      // Best-effort and feature-detected — a failed read keeps the last
+      // good index rather than dropping identities mid-session.
+      if (typeof host.profileRoutes === 'function') {
+        try {
+          indexAliasRoutes(await host.profileRoutes())
+        } catch {
+          /* keep the previous alias index */
+        }
+      }
+      const activeBot = route
+        ? { name: route.profile, sourceScoped: true, route }
+        : { name: String(host.state.profile?.get?.() || 'default').trim() || 'default' }
+      const local = await requestForBot(activeBot, 'profiles.list', {})
       // Newer backends inject the teammate-messaging protocol into every
       // session's system prompt (agent.bot_mode_protocol) — SOUL.md must not
       // carry a second copy. Older gateways lack the flag: keep appending.
@@ -2377,13 +4149,13 @@ function useRoster() {
       if (typeof host.agents === 'function') {
         try {
           const union = await host.agents()
-          return mergeMultiSourceRoster(local, union, activeConnectionId, $lastRoster.get())
+          return { ...mergeMultiSourceRoster(local, union, activeConnectionId, $lastRoster.get()), fetchedAt: issuedAt }
         } catch {
           /* older build or roster failure — single-source list stands */
         }
       }
 
-      return local
+      return { ...(local && typeof local === 'object' ? local : {}), fetchedAt: issuedAt }
     },
     refetchInterval: 5000,
     staleTime: 5000,
@@ -2394,6 +4166,52 @@ function useRoster() {
   })
 }
 
+/** Synchronous union-roster read for the composer surfaces (autocomplete
+ *  provider + mention middleware). useRoster caches under
+ *  [...ROSTER_KEY, activeConnectionId] — a 3-element key — so a bare
+ *  getQueryData(ROSTER_KEY) exact-match lookup returns undefined forever
+ *  (issue #89303: remote handles absent from @ autocomplete, mentions
+ *  unrouted). Read the live connection's entry first, then fall back to a
+ *  prefix scan keeping the freshest snapshot. Never throws: cold cache or
+ *  legacy queryClient returns null and callers fall back to their own path. */
+function cachedUnionRoster() {
+  if (typeof queryClient === 'undefined' || !queryClient || typeof queryClient.getQueryData !== 'function') {
+    return null
+  }
+
+  try {
+    const connectionId = String(
+      host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local'
+    )
+    const exact = queryClient.getQueryData([...ROSTER_KEY, connectionId])
+
+    if (Array.isArray(exact?.profiles)) {
+      return exact
+    }
+
+    if (typeof queryClient.getQueriesData === 'function') {
+      let best = null
+
+      // v5 takes a filters object; a legacy v3 queryClient treats the same
+      // object as the key itself and simply matches nothing — harmless.
+      for (const [, data] of queryClient.getQueriesData({ queryKey: ROSTER_KEY })) {
+        if (
+          Array.isArray(data?.profiles) &&
+          (!best || Number(data.fetchedAt || 0) > Number(best.fetchedAt || 0))
+        ) {
+          best = data
+        }
+      }
+
+      return best
+    }
+  } catch {
+    /* cache hiccup — caller falls back (middleware refetches) */
+  }
+
+  return null
+}
+
 /** Merge the union agent roster (host.agents) over the active gateway's
  *  profiles.list. Active-source rows — matched by the LIVE connection id,
  *  falling back to the roster's primaryConnectionId, then the legacy
@@ -2401,8 +4219,9 @@ function useRoster() {
  *  already returned: they only ANNOTATE the rich rows (handle, connection
  *  fields); rich fields stay authoritative and they are NOT duplicated.
  *  Rows from other sources become new roster entries tagged with their
- *  source label so BotRow can badge them and route open/warm through
- *  ensureAgent/warmAgent. Pure — exercised directly by the tests. */
+ *  source label so BotRow can badge them, warm the captured agent, and route
+ *  every open directly through that descriptor. Pure — exercised directly by
+ *  the tests. */
 function mergeMultiSourceRoster(local, union, activeConnectionId, previous = []) {
   const localProfiles = Array.isArray(local?.profiles) ? local.profiles : []
   const agents = Array.isArray(union?.agents) ? union.agents : []
@@ -2492,6 +4311,13 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
       row.connectionId = agent.connectionId
       row.connectionKind = agent.connectionKind
       row.connectionLabel = agent.connectionLabel
+      row.targetProfile = agent.targetProfile || profile
+      row.route = {
+        connectionId,
+        mode: agent.connectionKind === 'local' ? 'local' : 'remote',
+        profile,
+        targetProfile: agent.targetProfile || profile
+      }
       row.sourceScoped = true
       continue
     }
@@ -2508,6 +4334,13 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
       connectionId,
       connectionKind: agent.connectionKind,
       connectionLabel: agent.connectionLabel,
+      targetProfile: agent.targetProfile || profile,
+      route: {
+        connectionId,
+        mode: agent.connectionKind === 'local' ? 'local' : 'remote',
+        profile,
+        targetProfile: agent.targetProfile || profile
+      },
       remoteSource: true,
       sourceScoped: true
     })
@@ -2568,8 +4401,67 @@ function botHandle(name, bot) {
   return (name || '').trim().toLowerCase() === 'default' ? 'hermes' : name
 }
 
+/** Taggable @-forms derived from a bot's friendly names — the core profile
+ *  display name (`hermes profile rename`) and the Bot Mode title. Free text
+ *  reduces to the mention charset two ways: slugified ("Research Buddy" →
+ *  research-buddy, the form autocomplete inserts) and collapsed
+ *  (researchbuddy). Reserved tokens are dropped so a bot renamed "Hermes"
+ *  can never hijack the primary profile's @hermes alias. */
+function mentionNameForms(value) {
+  const name = String(value || '').trim().toLowerCase()
+
+  if (!name) {
+    return []
+  }
+
+  const slug = name.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+  const collapsed = name.replace(/[^a-z0-9_-]+/g, '')
+
+  return [...new Set([slug, collapsed])].filter(
+    form => /^[a-z0-9][a-z0-9_-]*$/.test(form) && !['all', 'everyone', 'user', 'default', 'hermes'].includes(form)
+  )
+}
+
+/** Every friendly (renameable) name a roster row carries: the Bot Mode title
+ *  (server-synced via ui_meta, locally stored, or persisted on a durable
+ *  group descriptor) and the core profile display_name — in displayName's
+ *  precedence order. Remote rows never borrow local meta (two `default`s
+ *  must not share a title) — EXCEPT the connection-exact alias identity
+ *  (#89131): a backend row claimed by a configured alias route carries the
+ *  alias's friendly names, so @moxie keeps resolving after handoff. */
+function botFriendlyNames(bot) {
+  const metaByName = typeof $botMeta !== 'undefined' ? $botMeta.get() : null
+  const localTitle = !bot?.remoteSource ? metaByName?.[bot?.name]?.title : null
+  const alias = aliasIdentityFor(bot)
+  const aliasTitle = alias
+    ? alias.metaKeys.map(key => metaByName?.[key]?.title).find(title => typeof title === 'string' && title.trim()) ||
+      alias.name
+    : null
+
+  return [bot?.ui_meta?.['hermes-bots']?.title, localTitle, aliasTitle, bot?.title, bot?.display_name]
+}
+
+/** The tag autocomplete inserts for a bot: the renamed (friendly) slug when
+ *  the user gave the bot a real name, otherwise the profile @handle. The
+ *  resolvers accept both, so older muscle memory keeps working. */
+function botMentionTag(bot) {
+  for (const friendly of botFriendlyNames(bot)) {
+    const forms = mentionNameForms(friendly)
+
+    if (forms.length) {
+      return forms[0]
+    }
+  }
+
+  return botHandle(bot?.name, bot)
+}
+
 function isActiveRosterBot(bot, active) {
-  const activeName = String(active?.name || 'default').trim() || 'default'
+  if (!active) {
+    return false
+  }
+
+  const activeName = String(active.name || 'default').trim() || 'default'
   const activeId = String(active?.connectionId || '').trim()
   const botId = String(bot?.connectionId || '').trim()
   const botName = String(bot?.name || '').trim() || 'default'
@@ -2583,6 +4475,26 @@ function isActiveRosterBot(bot, active) {
   }
 
   return botName === activeName
+}
+
+function botSelectionKey(bot) {
+  return bot?.sourceScoped || bot?.remoteSource ? botRosterKey(bot) : bot?.name
+}
+
+function isDefaultBot(bot) {
+  const route = botConnectionRoute(bot)
+
+  return String(route?.profile || bot?.name || '').trim().toLowerCase() === 'default'
+}
+
+function newBotChat(bot) {
+  if (typeof host.newChat !== 'function') {
+    host.navigate?.('/')
+
+    return
+  }
+
+  host.newChat(bot?.sourceScoped || bot?.remoteSource ? botConnectionRoute(bot) : bot?.name)
 }
 
 /** Resolve @handles in prose against the Bot Mode roster (local + Connections).
@@ -2604,6 +4516,15 @@ function resolveRosterMentions(text, roster, active = {}) {
 
     if (bot.handle) {
       forms.add(String(bot.handle).toLowerCase())
+    }
+
+    // Renamed bots are taggable by their friendly names too — the core
+    // profile display_name and the Bot Mode title (issue: renaming a bot
+    // didn't change what you @-tag it with).
+    for (const friendly of botFriendlyNames(bot)) {
+      for (const form of mentionNameForms(friendly)) {
+        forms.add(form)
+      }
     }
 
     for (const form of forms) {
@@ -2653,171 +4574,6 @@ function resolveRosterMentions(text, roster, active = {}) {
   return mentioned
 }
 
-const REMOTE_DM_TIMEOUT_MS = 180000
-const REMOTE_DM_POLL_MS = 2000
-
-/** The remote bot's canonical Bot Chat: pinned stored-id from its profile's
- *  ui_meta first, then resume-by-title, then create. Mirrors
- *  ensureGroupChatSession so DMs land in the ONE forever-chat instead of
- *  minting a fresh "Bot Chat" per mention. */
-async function ensureRemoteCanonicalChat(route, profile) {
-  let pinned = null
-
-  try {
-    const listed = await host.requestProfile(route, 'profiles.list', {})
-    const owner = listed?.profiles?.find(p => p.name === profile)
-    pinned = owner?.ui_meta?.['hermes-bots']?.chat || null
-  } catch {
-    /* older remote gateway — title lookup below still works */
-  }
-
-  for (const target of [pinned, 'Bot Chat']) {
-    if (!target) {
-      continue
-    }
-
-    try {
-      const res = await host.requestProfile(route, 'session.resume', {
-        session_id: target,
-        profile,
-        omit_messages: true
-      })
-
-      if (res?.session_id) {
-        return { runtime: res.session_id, stored: res.session_key || pinned }
-      }
-    } catch {
-      /* fall through */
-    }
-  }
-
-  const created = await host.requestProfile(route, 'session.create', {
-    profile,
-    title: 'Bot Chat',
-    // Bot Mode sessions are always hidden from the global sidebar.
-    hidden: true
-  })
-
-  return { runtime: created?.session_id || null, stored: created?.stored_session_id || null }
-}
-
-/** Bounded reply poll on the recipient's session — same shape as a group
- *  member turn: wait for a NEW assistant message after `before`, or time out. */
-async function pollRemoteDmReply(route, profile, sessionRef, before) {
-  const deadline = Date.now() + REMOTE_DM_TIMEOUT_MS
-
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, REMOTE_DM_POLL_MS))
-
-    let state = null
-
-    try {
-      state = await host.requestProfile(route, 'session.resume', { session_id: sessionRef, profile })
-    } catch {
-      continue
-    }
-
-    const messages = Array.isArray(state?.messages) ? state.messages : []
-    const done = !state?.inflight && !state?.running
-
-    if (messages.length > before && done) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i]
-
-        if (msg?.role === 'assistant') {
-          const text = typeof msg.content === 'string'
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
-              : msg?.text || ''
-
-          return String(text).trim() || null
-        }
-      }
-
-      return null
-    }
-  }
-
-  return null
-}
-
-/** Deliver a user mention to bots on OTHER connections: into each bot's
- *  canonical Bot Chat, with the standard sender-attribution prefix (so the
- *  recipient's messaging protocol recognizes an agent-to-agent message), then
- *  relay the reply back as a notification. Sequential and fire-and-forget
- *  from the composer's perspective. */
-async function deliverRemoteRosterMentions(bots, userText, sender) {
-  const text = String(userText || '').trim()
-
-  if (!text || typeof host.requestProfile !== 'function') {
-    return
-  }
-
-  const senderName = String(sender?.name || 'the user').trim()
-  const senderHandle = String(sender?.handle || senderName).trim()
-
-  for (const bot of bots) {
-    const connectionId = String(bot?.connectionId || '').trim()
-    const profile = String(bot?.name || '').trim() || 'default'
-
-    if (!connectionId || connectionId === 'local') {
-      continue
-    }
-
-    const route = { connectionId, mode: 'remote', profile, targetProfile: profile }
-    const label = bot.connectionLabel || connectionId
-
-    try {
-      const { runtime, stored } = await ensureRemoteCanonicalChat(route, profile)
-
-      if (!runtime) {
-        throw new Error('No remote session')
-      }
-
-      // Baseline before our submit, so the poll can spot the NEW reply.
-      let before = 0
-
-      try {
-        const pre = await host.requestProfile(route, 'session.resume', { session_id: stored || runtime, profile })
-        before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
-      } catch {
-        /* lazy session — zero messages */
-      }
-
-      // The delivery prefix is the recipient's cue that an agent (not its
-      // human) is talking — same contract as the local CLI handoff.
-      await host.requestProfile(route, 'prompt.submit', {
-        session_id: runtime,
-        text: `Message from \u{1F916} ${senderName} (@${senderHandle}): ${text}`
-      })
-      host.notify?.({
-        kind: 'info',
-        title: displayName(bot),
-        message: `Messaged @${botHandle(profile, bot)} on ${label} — will relay the reply here.`
-      })
-
-      const reply = await pollRemoteDmReply(route, profile, stored || runtime, before)
-
-      if (reply) {
-        host.notify?.({
-          kind: 'info',
-          title: `\u{1F916} ${displayName(bot)} (${label})`,
-          message: reply.slice(0, 500)
-        })
-      } else {
-        host.notify?.({
-          kind: 'info',
-          title: displayName(bot),
-          message: `No reply from @${botHandle(profile, bot)} yet — check its Bot Chat on ${label}.`
-        })
-      }
-    } catch (error) {
-      host.notifyError?.(error, `Could not reach ${label}`)
-    }
-  }
-}
-
 /** Source-qualified identity for a roster row — the React list key AND the
  *  cross-surface roster identity. Names alone are NOT unique in a
  *  multi-source roster (two connections can both expose 'default');
@@ -2827,33 +4583,135 @@ function botRosterKey(bot) {
   return `${bot?.connectionId || 'legacy'}::${bot?.name || 'default'}`
 }
 
+function botRouteKey(route) {
+  return `${route.connectionId}::${route.profile}`
+}
+
+function botMetaKey(bot) {
+  const route = botConnectionRoute(bot)
+
+  return route ? botRouteKey(route) : bot?.name
+}
+
+function persistBotMetaSnapshot(value, scoped = false) {
+  try {
+    const persisted = scoped
+      ? commitBotMetaV2(pluginCtx?.storage, value)
+      : Promise.resolve(pluginCtx?.storage?.set?.(BOT_META_V1_KEY, value))
+
+    return persisted.catch(() => undefined)
+  } catch {
+    return Promise.resolve()
+  }
+}
+
 // ── cross-connection routing ─────────────────────────────────────────────────
 // A bot from another registered connection (remoteSource rows) is reached
 // through host.requestProfile with a route descriptor; local bots keep the
 // active-gateway door. Feature-detected: older desktops without
 // requestProfile simply have no remote routes (callers fall back / disable).
 
-/** Route descriptor for a bot on another connection, or null for the local /
- *  active source (or when the desktop can't route). */
+/** Immutable owner descriptor for every source-scoped row. The active
+ *  gateway is presentation state and is never consulted here. */
 function botConnectionRoute(bot) {
-  const id = String(bot?.connectionId || '').trim()
-
-  if (!bot?.remoteSource || !id || id === 'local' || typeof host.requestProfile !== 'function') {
+  if (!bot?.sourceScoped && !bot?.remoteSource) {
     return null
   }
 
-  const profile = String(bot?.name || '').trim() || 'default'
+  const candidate = bot.route || {
+    connectionId: bot.connectionId,
+    mode: bot.connectionKind === 'local' ? 'local' : 'remote',
+    profile: bot.name,
+    targetProfile: bot.targetProfile || bot.name
+  }
+  const connectionId = String(candidate?.connectionId || '').trim()
+  const profile = String(candidate?.profile || bot?.name || '').trim() || 'default'
+  const targetProfile = String(candidate?.targetProfile || profile).trim() || profile
 
-  return { connectionId: id, mode: 'remote', profile, targetProfile: profile }
+  if (!connectionId) {
+    throw new Error(`Bot ${profile} has no connection owner`)
+  }
+
+  return Object.freeze({
+    connectionId,
+    mode: candidate.mode === 'local' || connectionId === 'local' ? 'local' : 'remote',
+    profile,
+    targetProfile
+  })
 }
 
-/** Gateway RPC on the bot's OWN source: requestProfile for remote rows,
- *  the active gateway for local ones. Never activates/foregrounds. */
+function backendTargetProfile(route, fallbackProfile = 'default') {
+  if (!route) {
+    return fallbackProfile
+  }
+
+  return route.targetProfile || route.profile
+}
+
+function rewriteCliProfileOperands(argv, logical, target) {
+  const next = [...argv]
+
+  for (let index = 0; index < next.length; index += 1) {
+    if (next[index] === '--profile' && next[index + 1] === logical) {
+      next[index + 1] = target
+      index += 1
+    } else if (next[index] === `--profile=${logical}`) {
+      next[index] = `--profile=${target}`
+    }
+  }
+
+  const profileCommand = next.indexOf('profile')
+  const operand = profileCommand >= 0 ? profileCommand + 2 : -1
+  if (operand < next.length && next[operand] === logical) {
+    next[operand] = target
+  }
+
+  return next
+}
+
+function scopedBotParams(route, method, params) {
+  const logical = route.profile
+  const target = backendTargetProfile(route, logical)
+  let next = params
+
+  if (Object.prototype.hasOwnProperty.call(params, 'profile')) {
+    next = { ...next, profile: target }
+  }
+
+  if (method.startsWith('profiles.') && method !== 'profiles.create' && params.name === logical) {
+    next = { ...next, name: target }
+  }
+
+  if (params.clone_from === logical) {
+    next = { ...next, clone_from: target }
+  }
+
+  if (method === 'cli.exec' && Array.isArray(params.argv)) {
+    next = { ...next, argv: rewriteCliProfileOperands(params.argv, logical, target) }
+  }
+
+  return next
+}
+
+function botBackendProfileScope(route, fallbackProfile = 'default') {
+  if (!route) {
+    return fallbackProfile
+  }
+
+  return { connectionId: route.connectionId, profile: backendTargetProfile(route, fallbackProfile) }
+}
+
+/** Gateway RPC on the bot's OWN source. Source-scoped rows always use the
+ * explicit descriptor, including a registered local source. */
 async function requestForBot(bot, method, params = {}) {
   const route = botConnectionRoute(bot)
 
   if (route) {
-    return host.requestProfile(route, method, params)
+    if (typeof host.requestProfile !== 'function') {
+      throw new Error(`Cannot route ${method} for ${route.connectionId}::${route.profile}`)
+    }
+
+    return host.requestProfile(route, method, scopedBotParams(route, method, params))
   }
 
   return host.request(method, params)
@@ -2864,15 +4722,146 @@ async function requestForBot(bot, method, params = {}) {
  *  remote members get the source-qualified key so `dixie` on the Mini and a
  *  local `dixie` never share watermarks or sessions. */
 function groupMemberKey(member) {
-  return member?.remoteSource ? botRosterKey(member) : member?.name
+  return member?.sourceScoped || member?.remoteSource ? botRosterKey(member) : member?.name
+}
+
+/** Serializable immutable owner captured beside every group plumbing session. */
+function groupSessionOwner(member) {
+  const route = botConnectionRoute(member)
+  const name = String(route?.profile || member?.name || '').trim() || 'default'
+
+  if (!route) {
+    return { name }
+  }
+
+  return {
+    connectionId: route.connectionId,
+    name,
+    sourceScoped: true,
+    remoteSource: route.mode !== 'local',
+    route: { ...route }
+  }
+}
+
+// ── alias identity for connection rows (#89131) ─────────────────────────────
+// A Desktop per-profile alias (profile `moxie` with a Cloud/URL/SSH override)
+// routes to a remote backend's root profile: its route reads
+// { connectionId: C, profile: 'moxie', targetProfile: 'default' }. Once that
+// backend answers the roster itself, the row's identity is (C, 'default') —
+// a DIFFERENT key than the alias meta (C::moxie / 'moxie') — so the friendly
+// name fell off after source/session activation: the row regressed to the
+// raw Cloud hostname, or to generic 'Hermes' in Cloud-only mode.
+//
+// aliasRouteIndex bridges the backend row identity back to its configured
+// alias. It is keyed by (connectionId, targetProfile), so two same-named
+// `default` rows on different connections can never share a title, and it
+// fails closed when two aliases claim the same backend row (mirroring the
+// fail-closed route resolution). This is the one sanctioned exception to
+// "remote rows never borrow local meta": the alias IS the local identity of
+// exactly this connection row, proven by the configured route — never by a
+// bare name match.
+let aliasRouteIndex = new Map()
+
+/** Rebuild the alias index from the credential-free route inventory. Only
+ *  genuine aliases (route.profile !== route.targetProfile) participate. */
+function indexAliasRoutes(routes) {
+  const next = new Map()
+
+  for (const route of Array.isArray(routes) ? routes : []) {
+    const connectionId = String(route?.connectionId || '').trim()
+    const profile = String(route?.profile || '').trim()
+    const target = String(route?.targetProfile || '').trim()
+
+    if (!connectionId || !profile || !target || profile === target) {
+      continue
+    }
+
+    const key = `${connectionId}::${target}`
+
+    // Two aliases pointing at the same backend row are ambiguous — neither
+    // may claim the identity.
+    next.set(key, next.has(key) ? null : {
+      name: profile,
+      // Alias meta can live under the source-qualified v2 key or the bare
+      // v1 name key (aliases predate the v2 migration on mixed setups).
+      metaKeys: [`${connectionId}::${profile}`, profile]
+    })
+  }
+
+  aliasRouteIndex = next
+}
+
+/** The configured alias identity claiming this roster row, or null. Matches
+ *  strictly by (connectionId, backend target profile); the alias row itself
+ *  keeps resolving its own meta directly. */
+function aliasIdentityFor(bot) {
+  if (!aliasRouteIndex.size) {
+    return null
+  }
+
+  const connectionId = String(
+    bot?.connectionId ||
+      bot?.route?.connectionId ||
+      // Unannotated rich rows (no host.agents on this build) still belong to
+      // the ACTIVE gateway — Cloud-only mode must resolve the alias too.
+      (!bot?.remoteSource && !bot?.sourceScoped ? host.state.connectionId?.get?.() || '' : '')
+  ).trim()
+
+  if (!connectionId) {
+    return null
+  }
+
+  const target = String(bot?.targetProfile || bot?.route?.targetProfile || bot?.name || '').trim() || 'default'
+  const entry = aliasRouteIndex.get(`${connectionId}::${target}`) || null
+
+  return entry && entry.name !== String(bot?.name || '').trim() ? entry : null
 }
 
 // Bot metadata is scoped to the active gateway until the server exposes a
 // union of rich profile rows. Never paint that metadata onto a thin row from
 // another source: two `default` agents must not borrow each other's title,
-// pin, avatar, group, unread state, or canonical-chat pointer.
+// pin, avatar, group, unread state, or canonical-chat pointer. The ONE
+// exception is a configured alias route claiming the row — see
+// aliasRouteIndex above — which is connection-exact, never name-based.
 function botRosterMeta(bot, metaByName) {
-  return bot?.remoteSource ? null : metaByName?.[bot?.name]
+  if (bot?.sourceScoped || bot?.remoteSource) {
+    const route = botConnectionRoute(bot)
+    const direct = route ? metaByName?.[botRouteKey(route)] : null
+
+    if (direct) {
+      return direct
+    }
+
+    const alias = aliasIdentityFor(bot)
+
+    if (alias) {
+      for (const key of alias.metaKeys) {
+        if (metaByName?.[key]) {
+          return metaByName[key]
+        }
+      }
+    }
+
+    return direct
+  }
+
+  const own = metaByName?.[bot?.name]
+
+  if (own) {
+    return own
+  }
+
+  const alias = aliasIdentityFor(bot)
+
+  if (alias) {
+    for (const key of alias.metaKeys) {
+      if (metaByName?.[key]) {
+        return metaByName[key]
+      }
+    }
+  }
+
+  return own
 }
 
 function showsHandle(name, meta, bot) {
@@ -2881,38 +4870,150 @@ function showsHandle(name, meta, bot) {
 }
 
 // ── canonical bot chat ───────────────────────────────────────────────────────
-// Each bot has ONE forever chat, pinned by stored-session id in bot meta
-// (meta.chat — synced server-side via ui_meta, so it follows the profile).
-// Opening a bot ALWAYS lands there: never "most recent session", which
-// drifts whenever the profile is used from the CLI, Sessions mode, or a
-// cronjob. The pin only changes through explicit adoption:
-//   - grandfather: first open of a bot that already has history pins its
-//     current latest session, so continuity starts from the chat in use
-//   - fresh bot: opens a draft; when the first message persists a stored
-//     session, we adopt that id (empty sessions are pruned server-side, so
-//     pre-creating one at enable time is not possible)
-//   - recovery: if the pinned id vanishes from the DB (compaction rewrote
-//     the lineage), re-pin the newest session carrying the canonical title.
+// Each bot has ONE forever chat, identified by NAME, never by pointer: the
+// session titled exactly "Bot Chat" on that bot's profile. The core
+// UNIQUE(title) index makes (profile, "Bot Chat") an exact registry, so every
+// open consults that registry directly — there is nothing to verify, re-pin,
+// grandfather, or recover. Stored-id pins (ui_meta['hermes-bots'].chat) were
+// the previous identity and are REMOVED: every lost-chat incident traced to a
+// dangled or stolen pointer that later guards then welded in. Legacy
+// ui_meta.chat keys are simply ignored.
 
 // In-flight creations, keyed by bot name — double-clicking a row must not
 // mint two canonical chats.
 const canonicalCreations = new Map()
 
-/** Create the bot's ONE forever chat: a real session opened with a kickoff
- *  message (the gateway prunes zero-message sessions, so the chat is born
- *  with the bot introducing itself). Pins the stored id in bot meta and
- *  returns it. */
-function createCanonicalChat(name) {
-  const inflight = canonicalCreations.get(name)
+/** Upper bound for per-profile session.list scans (hide sweep, canonical-chat
+ *  adoption, stored-session lookups). */
+const PROFILE_SESSION_LIST_LIMIT = 200
+let botOpenGeneration = 0
+
+/** The one canonical title. (profile, CANONICAL_CHAT_TITLE) IS the bot's
+ *  forever-chat identity — see the header above. */
+const CANONICAL_CHAT_TITLE = 'Bot Chat'
+
+async function openStoredBotChat(owner, storedId, summary) {
+  if (!storedId || typeof host.openSession !== 'function') {
+    throw new Error('This Hermes Desktop version cannot open stored sessions')
+  }
+
+  const { name, route } = botOwner(owner)
+
+  const hasAuthoritativeCount =
+    typeof summary?.message_count === 'number' && Number.isFinite(summary.message_count)
+  const expectHistory = hasAuthoritativeCount ? summary.message_count > 0 : true
+
+  // A profile backend that just woke up can lose the hydration-timeout race
+  // even though the session is fine (hermes-agent#89617) — clicking Retry
+  // succeeds because the backend is warm by then. retryHydrationTimeoutOnce
+  // asks the SDK layer to retry that same wait internally, BEFORE it arms the
+  // core stranded-session overlay: a plugin-side retry can't do this because
+  // only host.openSession sees the resume-exhausted latch that overlay reads.
+  await host.openSession(storedId, {
+    ...(route ? { route } : {}),
+    profile: name,
+    intent: 'main',
+    awaitHydration: true,
+    expectHistory,
+    // Move the WORKSPACE onto this bot, not just the transcript.
+    //
+    // With the default (true) the bot's chat opened against its own backend
+    // while `$activeGatewayProfile` stayed on whatever profile was active
+    // before — so "New session" from inside any bot was created on that other
+    // backend. Measured: four consecutive new chats started from different
+    // bots all landed in the `ops` profile's state.db. Clicking a bot is a
+    // workspace switch in this product (one bot = one workspace), so the
+    // chrome has to follow. EXCEPT across connections: a remote bot's chat
+    // opens on its own source while Desktop's chrome/API home stays put —
+    // re-homing the window onto another machine for one chat is the bug
+    // #90006 exists to remove.
+    keepAllProfilesScope: route ? true : false,
+    retryHydrationTimeoutOnce: true
+  })
+
+  return storedId
+}
+
+/** True when a session summary IS the canonical registry row. root_title is
+ *  the durable lineage-root title reported by exact-lookup gateways; plain
+ *  title covers windowed listings. */
+function isCanonicalBotChatHistory(history) {
+  const rootTitle = String(history?.root_title || '').trim()
+  const title = String(history?.title || '').trim()
+  return rootTitle === CANONICAL_CHAT_TITLE || (!rootTitle && title === CANONICAL_CHAT_TITLE)
+}
+
+/** THE identity lookup: the profile's session titled exactly "Bot Chat",
+ *  consulted on the bot's OWN source. The core UNIQUE title index guarantees
+ *  at most ONE such row per profile db — Profile → Named Session is an exact
+ *  registry, so consult it exactly: `title` asks the gateway for an indexed
+ *  WHERE title = ? lookup (window-free; a busy profile can push the
+ *  forever-chat past any recency window). include_hidden is required
+ *  (canonical chats are always hidden). Remote bots route via requestForBot
+ *  on the immutable captured owner — activation is a UI concern and never
+ *  authorizes this RPC. */
+async function findExistingCanonicalChat(owner) {
+  const { bot, name, route } = botOwner(owner)
+
+  // FAIL CLOSED. A failed registry lookup MUST NOT read as "no Bot Chat
+  // exists" — that is the one remaining way to fork a bot's forever chat.
+  // The failure lives exactly in the post-update window: the desktop
+  // restarts every profile backend, the first bot click races the warm-up,
+  // the lookup RPC fails transiently, and a swallowed error here sent
+  // createCanonicalChat() straight to session.create — minting a fresh
+  // "Bot Chat" while the real one (data intact, hidden) still held the
+  // canonical title. Users read that as "my bot lost all context after the
+  // update". Cross-connection lookups fail MORE often (network), so this
+  // matters doubly for remote bots. Both open paths catch and toast "try
+  // again", which is the correct outcome: retry, never mint.
+  let res
+  try {
+    res = await requestForBot(bot, 'session.list', {
+      profile: backendTargetProfile(route, name),
+      title: CANONICAL_CHAT_TITLE,
+      limit: PROFILE_SESSION_LIST_LIMIT,
+      include_hidden: true
+    })
+  } catch (error) {
+    const detail = error instanceof Error && error.message ? ` (${error.message})` : ''
+    throw new Error(`Could not check ${name}'s Bot Chat registry${detail} — not starting a new chat`)
+  }
+
+  const rows = res?.sessions ?? []
+  return rows.find(row => isCanonicalBotChatHistory(row)) || null
+}
+
+/** Create the bot's ONE forever chat: a real session titled "Bot Chat",
+ *  opened with a kickoff message (the gateway prunes zero-message sessions,
+ *  so the chat is born with the bot introducing itself). Adopts the existing
+ *  "Bot Chat" row instead of creating when the profile already has one —
+ *  minting while a "Bot Chat" row exists is always wrong twice over: it
+ *  forks the forever-chat AND the new row can never take the (already held)
+ *  canonical title. Creates on the bot's own source via requestForBot. */
+function createCanonicalChat(owner) {
+  const { bot, name, key, route } = botOwner(owner)
+  const inflight = canonicalCreations.get(key)
 
   if (inflight) {
     return inflight
   }
 
   const run = (async () => {
-    const res = await host.request('session.create', {
-      profile: name,
-      title: 'Bot Chat',
+    const existing = await findExistingCanonicalChat(owner)
+
+    if (existing?.id) {
+      if (typeof host.openSession === 'function') {
+        // The exact-lookup gateway reports the compression-lineage tip as
+        // resolved_id; open the tip, the registry row stays the identity.
+        await openStoredBotChat(owner, existing.resolved_id || existing.id, existing)
+      }
+
+      return existing.id
+    }
+
+    const res = await requestForBot(bot, 'session.create', {
+      profile: backendTargetProfile(route, name),
+      title: CANONICAL_CHAT_TITLE,
       // Always born hidden from the global sidebar — Bot Mode sessions are
       // plugin-owned. Core applies this via the generic `hidden` flag
       // (deferred as pending_hidden until the row exists); older gateways
@@ -2922,8 +5023,22 @@ function createCanonicalChat(name) {
     const sid = res?.stored_session_id
     const runtime = res?.session_id
 
-    if (sid) {
-      saveBotMeta(name, { chat: sid })
+    // session.create is intentionally lazy: its stored row does not exist until
+    // the first prompt. Mounting `sid` immediately therefore emits a noisy REST
+    // 404 ("Session not found"), and the turn-start auto-titler can win the race
+    // against the deferred `title: 'Bot Chat'` — under name-identity that is an
+    // identity outage: until the row is titled, the registry has no "Bot Chat"
+    // entry, so a second click during the intro turn mints a duplicate.
+    // session.title materializes the row now and records a user-authority title
+    // before either the open or kickoff, closing both the 404 race and the
+    // untitled window. Older gateways may not support the eager write; retain
+    // the kickoff-and-retry fallback below.
+    if (runtime) {
+      try {
+        await requestForBot(bot, 'session.title', { session_id: runtime, title: CANONICAL_CHAT_TITLE })
+      } catch {
+        /* compatibility fallback: prompt.submit will persist the lazy row */
+      }
     }
 
     // Mount the session view FIRST, then send the kickoff — submitting into
@@ -2932,7 +5047,12 @@ function createCanonicalChat(name) {
 
     if (sid && typeof host.openSession === 'function') {
       try {
-        await host.openSession(sid, { profile: name })
+        await host.openSession(sid, {
+          ...(route ? { route } : {}),
+          profile: name,
+          intent: 'main',
+          keepAllProfilesScope: route ? true : false
+        })
         opened = true
       } catch {
         // The stored row may not exist until the kickoff persists it. Retry
@@ -2944,158 +5064,103 @@ function createCanonicalChat(name) {
       await new Promise(resolve => window.setTimeout(resolve, 400))
 
       try {
-        await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
+        await requestForBot(bot, 'prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
 
         if (!opened && sid && typeof host.openSession === 'function') {
-          await host.openSession(sid, { profile: name })
+          await host.openSession(sid, {
+            ...(route ? { route } : {}),
+            profile: name,
+            intent: 'main',
+            keepAllProfilesScope: route ? true : false
+          })
         }
       } catch {
-        // The chat already exists. Keep the pin so the next click
-        // opens it instead of making a second Bot Chat.
+        // The chat already exists under the canonical title — the next click
+        // finds it by name instead of making a second Bot Chat.
       }
     }
 
     return sid || null
-  })().finally(() => canonicalCreations.delete(name))
+  })().finally(() => canonicalCreations.delete(key))
 
-  canonicalCreations.set(name, run)
+  canonicalCreations.set(key, run)
 
   return run
 }
 
-/** Open the bot's ONE forever chat and return the opened id (or the pin).
+/** Open the bot's ONE forever chat and return the opened registry id.
  *
- *  Identity rules (hermes-agent#88200 — the row must open the session its
- *  preview describes):
- *  - grandfather: no pin + existing history adopts the previewed session
- *    (`history`, the roster's last_session for this bot) instead of minting
- *    a new empty chat;
- *  - a live pin is verified through the backend's precise preferred_session
- *    resolver (hidden rows still resolve; compression lineages resolve to
- *    the live tip) — never inferred from a paginated, hidden-excluding
- *    session.list window, which misjudged real hidden pins as gone;
- *  - transient lookup failures keep the pin: try the stored id as-is, and
- *    only a rejected open enters recovery. */
-async function openBotCanonicalChat(name, pinned, history) {
-  if (!pinned) {
-    // Grandfather: adopt the conversation the row already previews.
-    const adoptId = history?.id
-    if (adoptId && typeof host.openSession === 'function') {
-      try {
-        await host.openSession(adoptId, { profile: name })
-        saveBotMeta(name, { chat: adoptId })
-        return adoptId
-      } catch {
-        // Adoption raced a vanishing session — fall through to creation.
-      }
-    }
-    return createCanonicalChat(name)
+ *  The whole resolution is one registry consultation ON THE BOT'S OWN
+ *  SOURCE: the profile's session titled "Bot Chat" exists → open it
+ *  (lineage tip); it doesn't → create it. No id pointer is read or written
+ *  anywhere in this path — remote bots included. The owner route rides
+ *  every RPC (requestForBot) and the open (openStoredBotChat), so a remote
+ *  bot's chat opens without re-homing Desktop's chrome. */
+async function openBotCanonicalChat(owner) {
+  const existing = await findExistingCanonicalChat(owner)
+
+  if (existing?.id && typeof host.openSession === 'function') {
+    await openStoredBotChat(owner, existing.resolved_id || existing.id, existing)
+    return existing.id
   }
 
-  // Precise verification. An older gateway ignores the unknown param and
-  // omits the key — that reads as a lookup failure below, NOT as a missing
-  // session, so legacy backends keep the try-as-is escape hatch.
-  let preferred
-  let lookupFailed = false
-  try {
-    const res = await host.request('profiles.list', {
-      include_sessions: true,
-      preferred_session_ids: { [name]: pinned }
-    })
-    const row = (res?.profiles ?? []).find(p => p.name === name)
-    preferred = row?.preferred_session
-    if (preferred === undefined) {
-      lookupFailed = true
-    }
-  } catch {
-    lookupFailed = true
-  }
-
-  if (lookupFailed) {
-    // Transient gateway state (or an older backend): the pin is innocent
-    // until proven guilty — try it as-is, and only a rejected open clears.
-    try {
-      await host.openSession(pinned, { profile: name })
-      return pinned
-    } catch {
-      saveBotMeta(name, { chat: null })
-      return createCanonicalChat(name)
-    }
-  }
-
-  if (preferred) {
-    try {
-      await host.openSession(preferred.resolved_id || preferred.id, { profile: name })
-      return pinned
-    } catch (error) {
-      // The precise lookup JUST confirmed this session exists, so a failed
-      // open is transient (reconnect, backend restart). Clearing the pin or
-      // minting a replacement here would fork the bot's forever-chat on
-      // every hiccup — report and keep everything as it is.
-      host.notifyError?.(error, `Could not open ${name}'s chat — try again`)
-      return pinned
-    }
-  }
-
-  // Definitively gone (db reset, or the lineage was rewritten past
-  // recovery): re-anchor on the previewed session when there is one.
-  const recoveryId = history?.id
-  if (recoveryId && typeof host.openSession === 'function') {
-    try {
-      await host.openSession(recoveryId, { profile: name })
-      saveBotMeta(name, { chat: recoveryId })
-      return recoveryId
-    } catch {
-      // Fall through to a fresh chat.
-    }
-  }
-  saveBotMeta(name, { chat: null })
-  return createCanonicalChat(name)
+  return createCanonicalChat(owner)
 }
 
-async function prepareBotSource(bot, pinnedChat) {
+async function prepareBotSource(bot) {
   if (!bot.sourceScoped) {
-    return pinnedChat
+    return
   }
 
-  if (typeof host.ensureAgent !== 'function') {
+  // Cross-connection RPCs ride the immutable captured route (requestForBot →
+  // host.requestProfile) — Desktop's active connection does not move, and
+  // activation is a UI concern that never authorizes the calls. All this
+  // gate does is refuse when the desktop predates routed profile requests.
+  const route = botConnectionRoute(bot)
+
+  if (route && typeof host.requestProfile !== 'function') {
     throw new Error('Update Hermes Desktop to chat with agents on other connections.')
   }
 
-  await host.ensureAgent(bot.connectionId, bot.name)
-
-  if (!bot.remoteSource) {
-    return pinnedChat
-  }
-
-  const liveId = String(typeof host.activeConnectionId === 'function' ? host.activeConnectionId() || '' : '').trim()
-  const targetId = String(bot.connectionId || '').trim()
-
-  if (targetId && targetId !== 'local' && liveId !== targetId) {
-    throw new Error(`Still on ${liveId || 'this device'}, not ${bot.connectionLabel || targetId}`)
-  }
-
-  // Thin rows deliberately omit metadata from the active source. Once their
-  // owner is active, recover that source's canonical-chat pointer so
-  // same-named agents never reuse or overwrite each other's pin.
-  try {
-    const refreshed = await host.request('profiles.list', {})
-    const owner = refreshed?.profiles?.find(profile => profile.name === bot.name)
-
-    return owner?.ui_meta?.['hermes-bots']?.chat || null
-  } catch {
-    // Metadata refresh is best-effort; canonical creation remains the fallback.
-    return null
+  if (!route && typeof host.ensureAgent === 'function') {
+    // Source-annotated row on the ACTIVE connection (no captured route):
+    // legacy activation path, unchanged.
+    await host.ensureAgent(bot.connectionId, bot.name)
   }
 }
 
+async function ensureBotMetadata(bot) {
+  if (!bot?.sourceScoped) {
+    return botRosterMeta(bot, $botMeta.get()) || {}
+  }
+
+  const route = botConnectionRoute(bot)
+  const backendProfile = backendTargetProfile(route, bot.name)
+  const result = await requestForBot(bot, 'profiles.list', {})
+  const row = (result?.profiles || []).find(profile => profile?.name === backendProfile)
+  const server = row?.ui_meta?.['hermes-bots']
+
+  if (server && typeof server === 'object') {
+    const key = botMetaKey(bot)
+    $botMeta.set({ ...$botMeta.get(), [key]: { ...($botMeta.get()[key] || {}), ...server } })
+    persistBotMetaSnapshot($botMeta.get(), true)
+  }
+
+  return botRosterMeta(bot, $botMeta.get()) || {}
+}
+
 function displayName(bot, meta) {
+  // A configured alias route claiming this row overrides source-derived
+  // identity: the friendly alias name must survive hosted-session
+  // activation and Cloud-only rosters (#89131).
+  const alias = aliasIdentityFor(bot)
+
   // Only THIN rows from another source trade the friendly name for their
   // connection label — the active gateway's own default must keep reading
   // "Hermes". Annotated active rows carry sourceScoped too, and keying this
   // off sourceScoped renamed the user's main agent to an IP-derived label
   // (community report, Aug 17 2026).
-  if (bot?.remoteSource && (bot.name || '').trim().toLowerCase() === 'default' && bot.connectionLabel) {
+  if (bot?.remoteSource && (bot.name || '').trim().toLowerCase() === 'default' && bot.connectionLabel && !alias && !meta?.title?.trim()) {
     return bot.connectionLabel
   }
 
@@ -3108,6 +5173,14 @@ function displayName(bot, meta) {
   // Mode title. Rides the profiles.list row; presentation-only.
   if (typeof bot?.display_name === 'string' && bot.display_name.trim()) {
     return bot.display_name.trim()
+  }
+
+  // An untitled backend row claimed by an alias reads as the alias name —
+  // never generic "Hermes" or a hostname-derived label.
+  if (alias) {
+    const raw = alias.name.replace(/[-_]+/g, ' ').trim()
+
+    return raw.replace(/\b\w/g, ch => ch.toUpperCase())
   }
 
   // The primary profile is literally named "default" — as a bot identity
@@ -3217,12 +5290,25 @@ function groupChatNames(metaByName, rooms) {
   const names = new Set(knownGroups(metaByName))
 
   for (const [name, room] of Object.entries(rooms || {})) {
+    if (room?.tombstone) {
+      continue
+    }
+
     if ((Array.isArray(room?.members) && room.members.length) || (Array.isArray(room?.log) && room.log.length)) {
       names.add(name)
     }
   }
 
   return [...names]
+}
+
+/** Names of REAL rooms in the atom — disband tombstones excluded. Feeds the
+ *  create/rename collision sets so a just-disbanded name is immediately
+ *  reusable even while an in-flight drive's tombstone still holds its key. */
+function liveGroupChatNames() {
+  return Object.entries($groupChats.get())
+    .filter(([, room]) => !room?.tombstone)
+    .map(([name]) => name)
 }
 
 /** Millisecond timestamp of a room's newest log entry (0 for a silent room) —
@@ -3238,7 +5324,7 @@ function groupLastActivity(room) {
  *  Prefers the LIVE roster row for a stored descriptor when present. */
 function groupChatMemberBots(group, roster, metaByName) {
   const local = (roster || []).filter(
-    bot => !bot.remoteSource && botGroups(botRosterMeta(bot, metaByName)).includes(group)
+    bot => botGroups(botRosterMeta(bot, metaByName)).includes(group)
   )
   const stored = ($groupChats.get()[group] || {}).members || []
   const seated = new Set(local.map(botRosterKey))
@@ -3262,15 +5348,26 @@ function groupChatMemberBots(group, roster, metaByName) {
  *  source's row may become remote after a connection switch, so retaining it
  *  here is what keeps the same room intact across machines. */
 function durableGroupChatMembers(bots) {
-  return (bots || []).map(bot => ({
-    name: bot.name,
-    handle: bot.handle || bot.name,
-    connectionId: bot.connectionId,
-    connectionKind: bot.connectionKind,
-    connectionLabel: bot.connectionLabel,
-    remoteSource: true,
-    sourceScoped: true
-  }))
+  return (bots || []).map(bot => {
+    const route = botConnectionRoute(bot)
+    // Keep the friendly identity on the stored descriptor: after a
+    // connection switch the live roster row may be gone, and renamed-tag
+    // mentions must still resolve against the persisted member.
+    const title = String(botRosterMeta(bot, $botMeta.get())?.title || bot.ui_meta?.['hermes-bots']?.title || bot.title || '').trim()
+
+    return {
+      name: bot.name,
+      handle: bot.handle || bot.name,
+      ...(title ? { title } : {}),
+      ...(bot.display_name ? { display_name: bot.display_name } : {}),
+      connectionId: bot.connectionId,
+      connectionKind: bot.connectionKind,
+      connectionLabel: bot.connectionLabel,
+      ...(route ? { route, targetProfile: route.targetProfile } : {}),
+      remoteSource: true,
+      sourceScoped: Boolean(route)
+    }
+  })
 }
 
 /** Existing group names, alphabetical — feeds the Manage-groups dialog. */
@@ -3338,6 +5435,15 @@ function parseGroupChatMentions(text, members) {
         ? [title.toLowerCase(), title.toLowerCase().replace(/[\s_-]+/g, ''), title.split(/\s+/)[0].toLowerCase()]
         : [])
     ])
+
+    // Renamed members answer to their friendly names too (profile
+    // display_name and Bot Mode title), in slugged and collapsed forms —
+    // the same tags the roster autocomplete inserts.
+    for (const friendly of botFriendlyNames(member)) {
+      for (const form of mentionNameForms(friendly)) {
+        forms.add(form)
+      }
+    }
 
     for (const form of forms) {
       if (form) {
@@ -3425,8 +5531,19 @@ function groupSpeakerLabel(name) {
 /** Room-log line as a member sees it: `Name (user): …` / `Name: …` /
  *  `Name (you): …`. */
 function formatGroupChatLine(entry, viewerName) {
+  // Attachments are staged into each member's session as real payloads; the
+  // transcript line names them so the delta text and the bytes line up.
+  const attached = Array.isArray(entry.images) && entry.images.length
+    ? ` ${entry.images
+        .map(img => {
+          const label = img.kind === 'pdf' ? 'attached PDF' : img.kind === 'file' ? 'attached file' : 'attached image'
+          return `[${label}: ${img.name || 'image'}]`
+        })
+        .join(' ')}`
+    : ''
+
   if (entry.from.kind === 'user') {
-    return `${entry.from.name || 'User'} (user): ${entry.text}`
+    return `${entry.from.name || 'User'} (user): ${entry.text}${attached}`
   }
 
   const suffix = entry.from.name === viewerName ? ' (you)' : ''
@@ -3434,7 +5551,7 @@ function formatGroupChatLine(entry, viewerName) {
   // two machines stay tellable apart in every member's transcript.
   const source = entry.from.source ? ` [${entry.from.source}]` : ''
 
-  return `${groupSpeakerLabel(entry.from.name)}${suffix}${source}: ${entry.text}`
+  return `${groupSpeakerLabel(entry.from.name)}${suffix}${source}: ${entry.text}${attached}`
 }
 
 /** The full per-turn payload for one member: participation rules + the room
@@ -3482,7 +5599,7 @@ function trimGroupChatLog(log, watermarks, limit = GROUP_CHAT_HISTORY_LIMIT * 4)
 }
 
 /** Mutate one group's room state through the atom + persist the durable part. */
-function updateGroupChat(group, mutate) {
+function updateGroupChat(group, mutate, { sync = true } = {}) {
   const all = { ...$groupChats.get() }
   const current = all[group] || { log: [], watermarks: {}, epoch: 0, running: false }
   const next = mutate({ ...current, log: [...current.log], watermarks: { ...current.watermarks } })
@@ -3497,23 +5614,40 @@ function updateGroupChat(group, mutate) {
     const durable = {}
 
     for (const [name, room] of Object.entries(all)) {
+      // Disband tombstones are runtime-only coordination state (they hold the
+      // epoch bump for an in-flight drive). Persisting one would resurrect
+      // the room as an empty record on the next load AND keep its name
+      // "taken" for same-name recreates.
+      if (room.tombstone) {
+        continue
+      }
+
       durable[name] = {
         log: room.log,
         watermarks: room.watermarks,
         sessions: room.sessions || {},
+        sessionOwners: room.sessionOwners || {},
         // Timed-out turns awaiting a late reply — keyed by member, valued
         // with the pre-turn message baseline. Survives reloads so finished
         // work is still harvested after a window restart.
         stranded: room.stranded || {},
         // Source-qualified member descriptors keep the room whole when the
         // active connection changes and today's local members become remote.
-        members: Array.isArray(room.members) ? room.members : []
+        members: Array.isArray(room.members) ? room.members : [],
+        // Immutable room identity: the member-session title for new rooms.
+        roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+        // Room picture (small data URL, same normalization as bot avatars).
+        image: room.image || null,
+        syncRevision: Math.max(0, Number(room.syncRevision || 0))
       }
     }
 
     Promise.resolve(pluginCtx?.storage?.set?.('group-chats', durable)).catch(() => undefined)
   } catch {
     /* storage unavailable — room survives for this window only */
+  }
+  if (sync) {
+    scheduleGroupChatServerSync(all, { changedRooms: [group] })
   }
 
   return next
@@ -3523,7 +5657,7 @@ function updateGroupChat(group, mutate) {
  *  membership list (the metadata syncs cross-machine via ui_meta), drop the
  *  room log from the atom + plugin storage, and close the room view if it's
  *  open. Other group memberships and the members' per-group gateway sessions
- *  ("Group: <name>") are intentionally KEPT. */
+ *  ("Group: <roomId>", or legacy "Group: <name>") are intentionally KEPT. */
 async function disbandGroupChat(group, members) {
   // Invalidate any in-flight round-robin FIRST: bump the epoch so a running
   // drive bails at its next member boundary instead of appending to a room
@@ -3533,9 +5667,12 @@ async function disbandGroupChat(group, members) {
 
   delete all[group]
   // Keep a runtime-only tombstone while a drive may still be mid-turn; it
-  // carries no log and is never persisted, so it can't rehydrate.
+  // carries no log and is flagged so persistence and name-dedup skip it —
+  // updateGroupChat writes the WHOLE atom map, so an unflagged tombstone
+  // would be persisted by the next unrelated room write and its name would
+  // count as taken, suffixing a same-name recreate to "<name> 2" forever.
   if (prior.running) {
-    all[group] = { log: [], watermarks: {}, sessions: {}, epoch: (prior.epoch || 0) + 1, running: false }
+    all[group] = { log: [], watermarks: {}, sessions: {}, epoch: (prior.epoch || 0) + 1, running: false, tombstone: true }
   }
 
   $groupChats.set(all)
@@ -3551,6 +5688,7 @@ async function disbandGroupChat(group, members) {
 
   delete needs[group]
   $groupNeedsYou.set(needs)
+  clearGroupClarify(group)
 
   // Persist the room map WITHOUT the disbanded room so it can't come back
   // on the next window load.
@@ -3563,7 +5701,11 @@ async function disbandGroupChat(group, members) {
           log: room.log,
           watermarks: room.watermarks,
           sessions: room.sessions || {},
-          members: Array.isArray(room.members) ? room.members : []
+          sessionOwners: room.sessionOwners || {},
+          members: Array.isArray(room.members) ? room.members : [],
+          roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+          image: room.image || null,
+          syncRevision: Math.max(0, Number(room.syncRevision || 0))
         }
       }
     }
@@ -3572,22 +5714,159 @@ async function disbandGroupChat(group, members) {
   } catch {
     /* storage unavailable — the atom reset above still empties the room */
   }
+  scheduleGroupChatServerSync($groupChats.get(), { allowEmpty: true, deletedRooms: [group] })
 
   // Remove this membership last. saveBotMeta never throws (local storage +
   // best-effort profiles.configure per member), so a flaky gateway can't
   // strand the disband halfway with the room log already gone.
   for (const member of members) {
-    if (!member?.name || member.remoteSource) {
+    if (!member?.name) {
       continue
     }
 
-    const meta = $botMeta.get()[member.name] || {}
-    await saveBotMeta(member.name, groupMembershipPatch(meta, group, false))
+    const meta = botRosterMeta(member, $botMeta.get()) || {}
+    await saveBotMeta(member, groupMembershipPatch(meta, group, false))
+  }
+
+  // Converge on server truth: the cached roster still carries the pre-disband
+  // ui_meta (the write-fence in mergeServerMeta keeps it from resurrecting
+  // the membership, but a fresh snapshot is what makes every surface agree).
+  if (typeof queryClient !== 'undefined' && queryClient?.invalidateQueries) {
+    queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
   }
 }
 
-function appendGroupChatEntry(group, from, text, thread) {
-  const entry = { at: Date.now(), from, text: String(text).trim(), thread: thread || 'legacy' }
+/** Set or clear a group chat's room picture (small data URL, normalized by
+ *  the same pipeline as bot avatars). Persists with the room record. */
+function setGroupChatImage(group, image) {
+  updateGroupChat(group, room => {
+    room.image = image || null
+    return room
+  })
+}
+
+/** Rename a group chat. The group's NAME is its identity everywhere — the
+ *  room-map key, each local member's ui_meta membership list, and derived
+ *  state — so a rename re-keys all of them. Member gateway sessions are kept
+ *  as-is: stored sids keep resuming, so no history is lost. The room's
+ *  immutable roomId (the member-session title) is preserved across the
+ *  rename, so even a member whose sid is later lost falls back to the same
+ *  "Group: <roomId>" title lookup instead of a fresh "Group: <new name>".
+ *  Returns the new name, or null when the target name is taken. */
+async function renameGroupChat(oldName, newName, members) {
+  const next = String(newName || '').trim().slice(0, 64)
+
+  if (!next || next === oldName) {
+    return oldName
+  }
+
+  // Renames are explicit user intent: reject a collision honestly instead of
+  // silently suffixing like creation does. Disband tombstones don't hold
+  // their name — the room is gone, only its epoch survives briefly.
+  const taken = new Set(liveGroupChatNames())
+
+  for (const meta of Object.values($botMeta.get() || {})) {
+    for (const existing of botGroups(meta)) {
+      taken.add(existing)
+    }
+  }
+
+  taken.delete(oldName)
+
+  if (taken.has(next)) {
+    host.notify({ kind: 'error', message: `A group named “${next}” already exists.` })
+    return null
+  }
+
+  // Move the room record wholesale — log, watermarks, sessions, members,
+  // picture, and runtime flags all belong to the same room under its new name.
+  const all = { ...$groupChats.get() }
+  const room = all[oldName]
+
+  delete all[oldName]
+
+  if (room) {
+    all[next] = room
+  }
+
+  $groupChats.set(all)
+
+  const needs = { ...$groupNeedsYou.get() }
+
+  if (oldName in needs) {
+    needs[next] = needs[oldName]
+    delete needs[oldName]
+    $groupNeedsYou.set(needs)
+  }
+
+  // Mirrored clarify cards key by group name; drop the old room's — the
+  // next poll re-mirrors any still-blocking question under the new name.
+  clearGroupClarify(oldName)
+
+  // Local memberships: swap the name inside each member's canonical groups
+  // list (syncs cross-machine via ui_meta). Remote members' seating lives in
+  // the room record we just moved.
+  for (const member of members || []) {
+    if (!member?.name) {
+      continue
+    }
+
+    const meta = botRosterMeta(member, $botMeta.get()) || {}
+    const groups = [...new Set(botGroups(meta).map(g => (g === oldName ? next : g)))]
+
+    await saveBotMeta(member, { groups, group: groups[0] || null })
+  }
+
+  // Persist the re-keyed map (updateGroupChat writes the whole durable map).
+  updateGroupChat(next, r => r, { sync: false })
+  // A rename is one revisioned state transition: the new identity is updated
+  // and the old identity is tombstoned together, so cold hydration cannot
+  // merge the pre-rename room back into the roster.
+  scheduleGroupChatServerSync($groupChats.get(), {
+    changedRooms: [next],
+    deletedRooms: [oldName]
+  })
+
+  // Follow the open views to the new identity.
+  if ($groupChatWorkspace.get() === oldName) {
+    $groupChatWorkspace.set(next)
+  }
+
+  if (groupChatMainTabs.has(oldName)) {
+    closeGroupChatMainTab(oldName)
+    openGroupChat(next)
+  }
+
+  // Same convergence as disband: drop the pre-rename roster snapshot so the
+  // old name can't linger anywhere the fence doesn't cover.
+  if (typeof queryClient !== 'undefined' && queryClient?.invalidateQueries) {
+    queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+  }
+
+  return next
+}
+
+function groupChatEntryId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID()
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+function appendGroupChatEntry(group, from, text, thread, images) {
+  const entry = {
+    id: groupChatEntryId(),
+    at: Date.now(),
+    from,
+    text: String(text).trim(),
+    thread: thread || 'legacy'
+  }
+
+  if (Array.isArray(images) && images.length) {
+    // [{ name, data }] — data URLs. Persisted with the room log so reloads
+    // keep showing what the members were shown.
+    entry.images = images
+  }
 
   updateGroupChat(group, room => {
     room.log.push(entry)
@@ -3602,6 +5881,33 @@ function appendGroupChatEntry(group, from, text, thread) {
   return entry
 }
 
+/** Fresh room identity for a group. Independent of the editable display
+ *  name: a disbanded-and-recreated group mints a new roomId even when the
+ *  display name is identical, so member sessions never resume by title. */
+function mintGroupRoomId() {
+  return `r${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+}
+
+/** Unique display name for a NEW group. Collisions get a " 2", " 3", …
+ *  suffix; the BASE is truncated (never the joined string), so a 64-char
+ *  base keeps its suffix instead of colliding with the original. */
+function uniqueGroupChatName(base, taken) {
+  if (!taken.has(base)) {
+    return base
+  }
+
+  for (let n = 2; n < 100; n++) {
+    const suffix = ` ${n}`
+    const candidate = base.slice(0, 64 - suffix.length) + suffix
+
+    if (!taken.has(candidate)) {
+      return candidate
+    }
+  }
+
+  throw new Error('No free name for the group.')
+}
+
 /** Ensure the member's per-group session exists and return a LIVE runtime
  *  session id for it. Gateway-native: session.create mints the session
  *  (lazy until its first message), session.resume by stored id — or by
@@ -3609,8 +5915,11 @@ function appendGroupChatEntry(group, from, text, thread) {
  *  it after restarts. Cross-connection members route to their OWN source
  *  via requestForBot; the window's gateway never switches. */
 async function ensureGroupChatSession(group, member) {
-  const title = `Group: ${group}`
   const room = $groupChats.get()[group] || {}
+  // New rooms title member sessions by their immutable roomId so a
+  // same-name recreate never resumes the old room's sessions by title;
+  // legacy rooms without a roomId fall back to the display name.
+  const title = `Group: ${room.roomId || group}`
   const key = groupMemberKey(member)
   const known = room.sessions && room.sessions[key]
 
@@ -3628,7 +5937,17 @@ async function ensureGroupChatSession(group, member) {
       })
 
       if (res?.session_id) {
-        return { runtime: res.session_id, stored: res.session_key || known }
+        const stored = res.session_key || known
+
+        if (stored) {
+          updateGroupChat(group, current => {
+            current.sessions = { ...(current.sessions || {}), [key]: stored }
+            current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(member) }
+            return current
+          })
+        }
+
+        return { runtime: res.session_id, stored }
       }
     } catch {
       /* fall through to create */
@@ -3646,6 +5965,7 @@ async function ensureGroupChatSession(group, member) {
   if (stored) {
     updateGroupChat(group, r => {
       r.sessions = { ...(r.sessions || {}), [key]: stored }
+      r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(member) }
       return r
     })
   }
@@ -3662,6 +5982,145 @@ const GROUP_TURN_POLL_MS = 2000
 // reached the room (db's Aug 2026 report).
 const GROUP_TURN_HARD_CAP_MS = 20 * 60000
 
+/** Mirror a member's pending prompt — clarify question OR command approval —
+ *  from its resume snapshot into the room store, keyed
+ *  `${group}::${memberKey}` (#90694). Returns true while a prompt is
+ *  blocking, so the turn poll can extend its deadline — a waiting prompt
+ *  must not be eaten by the group-turn timeout. Feature-detected: older
+ *  backends without `pending_clarify`/`pending_approval` in the resume
+ *  payload always sync to "no prompt". Clarify wins when both are somehow
+ *  present (approvals resolve inside tool batches; clarify is the outer
+ *  blocker). */
+function syncGroupClarify(group, member, state) {
+  const key = `${group}::${groupMemberKey(member)}`
+  const clarify = state && typeof state.pending_clarify === 'object' ? state.pending_clarify : null
+  const approval = state && typeof state.pending_approval === 'object' ? state.pending_approval : null
+  const pending = clarify || approval
+  const requestId = pending?.request_id || null
+  const all = $groupClarify.get()
+  const current = all[key]
+
+  if (!requestId) {
+    if (current) {
+      const next = { ...all }
+      delete next[key]
+      $groupClarify.set(next)
+    }
+
+    return false
+  }
+
+  // Same request already mirrored — keep the object identity so the card
+  // doesn't lose its draft to a re-render.
+  if (current?.requestId === requestId) {
+    return true
+  }
+
+  const base = {
+    requestId,
+    group,
+    member: member.name,
+    memberKey: groupMemberKey(member),
+    // approval.respond keys on the session, not just the request — carry the
+    // runtime id the snapshot came from.
+    sessionId: state?.session_id || null,
+    at: Date.now()
+  }
+
+  $groupClarify.set({
+    ...all,
+    [key]: clarify
+      ? {
+          ...base,
+          kind: 'clarify',
+          question: typeof clarify.question === 'string' ? clarify.question : '',
+          choices: Array.isArray(clarify.choices) ? clarify.choices.filter(c => typeof c === 'string' && c) : [],
+          multiSelect: Boolean(clarify.multi_select),
+          // Batch clarifies carry `questions`; the room card answers them
+          // one wire call per question, mirroring the 1:1 batch contract.
+          questions: Array.isArray(clarify.questions) ? clarify.questions : null
+        }
+      : {
+          ...base,
+          kind: 'approval',
+          question: typeof approval.description === 'string' ? approval.description : '',
+          command: typeof approval.command === 'string' ? approval.command : '',
+          // The server precomputes the choice set from allow_permanent
+          // (once/session/always/deny); fall back to the minimal pair.
+          choices: Array.isArray(approval.choices) && approval.choices.length
+            ? approval.choices.filter(c => typeof c === 'string' && c)
+            : ['once', 'deny'],
+          multiSelect: false,
+          questions: null
+        }
+  })
+  // A blocked member is a question for the human — badge the room.
+  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: true })
+
+  return true
+}
+
+/** Drop every mirrored clarify belonging to `group` (disband/rename). */
+function clearGroupClarify(group) {
+  const all = $groupClarify.get()
+  const next = {}
+  let changed = false
+
+  for (const [key, value] of Object.entries(all)) {
+    if (value?.group === group) {
+      changed = true
+    } else {
+      next[key] = value
+    }
+  }
+
+  if (changed) {
+    $groupClarify.set(next)
+  }
+}
+
+/** Answer a member's pending prompt from the room. Routes to the member's
+ *  OWN source (requestForBot), so cross-connection members work.
+ *  - clarify: `clarify.respond`; batch questions send one respond per
+ *    question, sequentially — the LAST lock resolves the blocked tool
+ *    server-side (same contract as the 1:1 batch card). allow_expired
+ *    server-side makes racing the timeout harmless.
+ *  - approval: `approval.respond` with the choice (once/session/always/deny),
+ *    keyed by session + request_id — the same wire the 1:1 approval card
+ *    and native notifications use. */
+async function answerGroupClarify(entry, member, answers) {
+  if (entry.kind === 'approval') {
+    await requestForBot(member, 'approval.respond', {
+      session_id: entry.sessionId || undefined,
+      request_id: entry.requestId,
+      choice: typeof answers === 'string' && answers ? answers : 'deny'
+    })
+  } else if (entry.questions && entry.questions.length) {
+    for (const question of entry.questions) {
+      const qid = question?.qid ?? question?.id
+      await requestForBot(member, 'clarify.respond', {
+        request_id: entry.requestId,
+        question_id: qid,
+        answer: answers?.[qid] ?? ''
+      })
+    }
+  } else {
+    await requestForBot(member, 'clarify.respond', {
+      request_id: entry.requestId,
+      answer: typeof answers === 'string' ? answers : ''
+    })
+  }
+
+  const all = $groupClarify.get()
+  const key = `${entry.group}::${entry.memberKey}`
+
+  if (all[key]?.requestId === entry.requestId) {
+    const next = { ...all }
+    delete next[key]
+    $groupClarify.set(next)
+  }
+}
+
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
@@ -3669,12 +6128,14 @@ const GROUP_TURN_HARD_CAP_MS = 20 * 60000
  *  so slow models aren't cut off mid-run. A turn that still times out
  *  records a stranded marker so the finished reply can be harvested into
  *  the room at the member's next turn instead of being lost. */
-async function runGroupChatMemberTurn(group, member, prompt, thread) {
+async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   const { runtime, stored } = await ensureGroupChatSession(group, member)
 
   if (!runtime) {
     return null
   }
+
+  recordGroupActivity(group, { kind: 'working', member: member.name, thread })
 
   // Baseline: how many messages exist before our submit.
   let before = 0
@@ -3689,7 +6150,56 @@ async function runGroupChatMemberTurn(group, member, prompt, thread) {
     /* lazy session — zero messages */
   }
 
-  await requestForBot(member, 'prompt.submit', { session_id: runtime, text: prompt })
+  // Stage this delta's attachments into the member's session so the model
+  // receives the actual payload with the prompt — the same attach RPCs the
+  // 1:1 chat uses (they also work cross-connection, where the member's
+  // gateway can't see this machine's files). Images queue as vision tiles,
+  // PDFs render per-page via pdf.attach, and other files materialize in the
+  // session workspace (their @file: refs are appended to the prompt so the
+  // member's file tools can read them). A failed attach degrades that
+  // member to text-only; the transcript line still names the attachment so
+  // the member knows something was shared.
+  const fileRefs = []
+
+  for (const img of Array.isArray(images) ? images : []) {
+    if (!img || typeof img.data !== 'string' || !img.data) {
+      continue
+    }
+
+    try {
+      if (img.kind === 'pdf') {
+        await requestForBot(member, 'pdf.attach', {
+          session_id: runtime,
+          content_base64: img.data,
+          filename: img.name || 'attachment.pdf'
+        })
+      } else if (img.kind === 'file') {
+        const res = await requestForBot(member, 'file.attach', {
+          session_id: runtime,
+          data_url: img.data,
+          name: img.name || 'attachment'
+        })
+
+        if (res?.ref_text) {
+          fileRefs.push(`${img.name || 'attachment'} → ${res.ref_text}`)
+        }
+      } else {
+        await requestForBot(member, 'image.attach_bytes', {
+          session_id: runtime,
+          content_base64: img.data,
+          filename: img.name || 'attachment.png'
+        })
+      }
+    } catch {
+      /* text-only fallback for this member */
+    }
+  }
+
+  const turnText = fileRefs.length
+    ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}`
+    : prompt
+
+  await requestForBot(member, 'prompt.submit', { session_id: runtime, text: turnText })
 
   const started = Date.now()
   let deadline = started + GROUP_TURN_TIMEOUT_MS
@@ -3710,7 +6220,11 @@ async function runGroupChatMemberTurn(group, member, prompt, thread) {
 
     const messages = Array.isArray(state?.messages) ? state.messages : []
     const busy = Boolean(state?.inflight || state?.running)
-    const done = !busy
+    // A clarify blocking inside the member's session is a question for the
+    // HUMAN (#90694) — mirror it into the room store so a card renders, and
+    // hold the turn open: the member isn't stalling, it's waiting on us.
+    const awaitingUser = syncGroupClarify(group, member, state)
+    const done = !busy && !awaitingUser
 
     if (messages.length > before && done) {
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -3722,23 +6236,37 @@ async function runGroupChatMemberTurn(group, member, prompt, thread) {
             : Array.isArray(msg.content)
               ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
               : msg?.text || ''
+          const replyText = String(text).trim()
 
-          return String(text).trim()
+          recordGroupActivity(group, {
+            kind: isGroupPassText(replyText) ? 'passed' : 'replied',
+            member: member.name,
+            thread
+          })
+
+          return replyText
         }
       }
+
+      recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
 
       return null
     }
 
-    // Still visibly working: extend the deadline (never past the hard cap).
-    if (busy) {
+    // Still visibly working — or waiting on the user's answer to a clarify:
+    // extend the deadline (never past the hard cap). A pending question must
+    // outlive the base turn timeout or it dies unanswered at 3 minutes.
+    if (busy || awaitingUser) {
       deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
     }
   }
 
-  // Timeout — reads as a pass, but remember the baseline + thread
+  // Timeout — clear any still-mirrored question card (the server-side
+  // clarify timeout runs its own course) and read as a pass, but remember the baseline + thread
   // (runtime-only) so the finished reply can be posted late into the RIGHT
   // thread instead of vanishing.
+  recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
+  syncGroupClarify(group, member, null)
   updateGroupChat(group, r => {
     r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
     return r
@@ -3767,7 +6295,7 @@ async function harvestStrandedGroupReply(group, member) {
   try {
     const stored = room.sessions?.[memberKey]
     state = await requestForBot(member, 'session.resume', {
-      session_id: stored || `Group: ${group}`,
+      session_id: stored || `Group: ${room.roomId || group}`,
       profile: member.name
     })
   } catch {
@@ -3776,6 +6304,12 @@ async function harvestStrandedGroupReply(group, member) {
 
   if (state?.inflight || state?.running) {
     return // still grinding — keep waiting
+  }
+
+  // A stranded member blocked on a clarify is not "grinding" — surface the
+  // question card (#90694) and keep the marker until it resolves.
+  if (syncGroupClarify(group, member, state)) {
+    return
   }
 
   // Done (or dead): the marker is consumed either way.
@@ -3804,6 +6338,7 @@ async function harvestStrandedGroupReply(group, member) {
       const reply = String(text).trim()
 
       if (reply && !isGroupPassText(reply)) {
+        recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
         appendGroupChatEntry(
           group,
           { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
@@ -3838,6 +6373,7 @@ async function runGroupChatRounds(group, members, thread) {
       // late, never lost.
       for (const member of members) {
         if (!isCurrent()) {
+          recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
           return
         }
 
@@ -3845,11 +6381,28 @@ async function runGroupChatRounds(group, members, thread) {
       }
 
       const roomLog = (($groupChats.get()[group] || {}).log || []).filter(e => groupThreadOf(e) === thread)
+      // Exclude members the harvest pass just above confirmed are STILL
+      // running (their stranded marker survived harvest because
+      // state.inflight/running was true). Re-selecting one here would
+      // prompt.submit into their live session — the gateway's default busy
+      // policy redirects or hard-interrupts that turn (tui_gateway's
+      // _handle_busy_submit), killing exactly the long-running work this
+      // stranded/harvest mechanism exists to protect. Skip them; the next
+      // harvest pass picks the reply up once it actually lands. A marker's
+      // mere presence means "still stranded" (harvestStrandedGroupReply
+      // deletes it once the member is confirmed done/dead) — presence, not
+      // value shape, since markers are a bare number pre-thread or
+      // {before, thread} post-thread.
+      const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
       const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
+        .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
       let spokeThisRound = 0
 
       for (const member of responders) {
         if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES) {
+          if (!isCurrent()) {
+            recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
+          }
           return
         }
 
@@ -3872,6 +6425,12 @@ async function runGroupChatRounds(group, members, thread) {
           deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
         })
 
+        // Images riding this delta (user attachments — member entries don't
+        // carry images today, but flatMap keeps this future-proof) get staged
+        // into the member's session so the model sees the pixels, not just
+        // the transcript's [attached image: …] marker.
+        const deltaImages = delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
+
         // Surface WHO is on turn (runtime-only, like running/epoch) so the
         // room shows "Radar is thinking…" instead of a generic working line —
         // long model turns otherwise read as the room being stuck.
@@ -3883,8 +6442,9 @@ async function runGroupChatRounds(group, members, thread) {
         let reply = null
 
         try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread)
+          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
         } catch {
+          recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
           reply = null // a failed turn is a pass, never a room error
         }
 
@@ -3917,13 +6477,62 @@ async function runGroupChatRounds(group, members, thread) {
     }
   } finally {
     if (isCurrent()) {
+      recordGroupActivity(group, { kind: 'settled', member: null, thread })
       updateGroupChat(group, r => {
         r.running = false
         r.turn = null
         return r
       })
+
+      // #89545: the loop's harvest pass only ran at the top of each round of
+      // an ACTIVE loop — a member whose turn timed out after the final round
+      // stayed stranded until the user's NEXT send. Poll for the late reply
+      // in the background (bounded) so long work is late, never lost.
+      // (window feature-detect: the engine also runs under node in tests.)
+      const strandedLeft = Object.keys(($groupChats.get()[group] || {}).stranded || {})
+
+      if (strandedLeft.length && typeof window !== 'undefined') {
+        void harvestStrandedUntilSettled(group, members, thread)
+      }
     }
   }
+}
+
+/** Bounded background harvest for members whose replies outlived the turn
+ *  loop. Polls every 5s for up to 5 minutes; stops early when nothing is
+ *  stranded, a new loop takes the room over (it harvests on its own), or the
+ *  room record disappears (disband). */
+async function harvestStrandedUntilSettled(group, members, thread) {
+  const HARVEST_INTERVAL_MS = 5000
+  const HARVEST_MAX_TRIES = 60
+
+  for (let attempt = 0; attempt < HARVEST_MAX_TRIES; attempt++) {
+    await new Promise(resolve => window.setTimeout(resolve, HARVEST_INTERVAL_MS))
+
+    const room = $groupChats.get()[group]
+
+    if (!room || room.running) {
+      return
+    }
+
+    const stranded = room.stranded || {}
+
+    if (!Object.keys(stranded).length) {
+      return
+    }
+
+    for (const member of members) {
+      if (Object.prototype.hasOwnProperty.call(stranded, groupMemberKey(member))) {
+        try {
+          await harvestStrandedGroupReply(group, member)
+        } catch {
+          // Best-effort: the next tick retries; the bound stops runaways.
+        }
+      }
+    }
+  }
+
+  recordGroupActivity(group, { kind: 'failed', member: null, thread })
 }
 
 /** User send into a group room. `thread` continues that thread (its reply
@@ -3931,17 +6540,25 @@ async function runGroupChatRounds(group, members, thread) {
  *  Appends, bumps the room epoch (supersedes any running loop at its next
  *  member boundary), and starts the turn drive for the target thread.
  *  Returns the thread id the message landed in. */
-function sendToGroupChat(group, members, text, thread) {
+function sendToGroupChat(group, members, text, thread, images) {
   const trimmed = String(text || '').trim()
+  const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
 
-  if (!trimmed || !members.length) {
+  if ((!trimmed && !attached.length) || !members.length) {
     return null
   }
 
   const target = thread || mintGroupThreadId()
 
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
-  appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target)
+  // Refresh the durable room roster on every send. This backfills rooms made
+  // by older Desktop builds and keeps the gateway mirror complete even when
+  // members overlap across multiple groups.
+  updateGroupChat(group, room => {
+    room.members = durableGroupChatMembers(members)
+    return room
+  })
+  appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target, attached)
 
   const wasRunning = ($groupChats.get()[group] || {}).running === true
 
@@ -3950,6 +6567,8 @@ function sendToGroupChat(group, members, text, thread) {
     room.running = true
     return room
   })
+
+  recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
 
   if (!wasRunning) {
     void runGroupChatRounds(group, members, target).catch(() => {
@@ -4149,7 +6768,11 @@ function previewKind(preview) {
   }
   const match = text.match(A2A_RE)
   if (match) {
-    return { fromBot: (match[1] || match[2] || '').trim().toLowerCase() || null }
+    // The captured name is whatever the delivery prefix carried — a raw
+    // profile name. Map it the way every other surface does so the primary
+    // profile reads @hermes, never @default (#89484).
+    const sender = (match[1] || match[2] || '').trim().toLowerCase()
+    return { fromBot: sender ? botHandle(sender) : null }
   }
   return { fromBot: null }
 }
@@ -4185,17 +6808,55 @@ function generatedSessionTitle(session, preview) {
  *  seconds is treated as "active now" (pulsing dot in its row). */
 const ACTIVE_WINDOW_S = 90
 
+/** The session whose activity best represents this bot — the FRESHER of the
+ *  canonical Bot Chat (canonical_session, the profile's "Bot Chat" registry
+ *  row resolved server-side by name) and the profile's newest visible
+ *  conversation (last_session).
+ *
+ *  Canonical Bot Chats are hidden from the session list by design, so
+ *  last_session alone never sees them: a bot you talk to all day through its
+ *  Bot Chat reads "6d ago" because its newest VISIBLE session is a week old.
+ *  Every activity signal (age label, pulse dot, unread watermark, recency
+ *  sort) keys off this helper. Older gateways without the canonical_session
+ *  field degrade to last_session unchanged. */
+function botActivitySession(bot) {
+  const preferred = bot?.canonical_session
+  const last = bot?.last_session
+
+  if (!preferred || !last) {
+    return preferred || last || null
+  }
+
+  return (preferred.last_active || 0) >= (last.last_active || 0) ? preferred : last
+}
+
+/** Worker liveness window: kanban/tool workers heartbeat last_activity_at
+ *  at least every 60s while running (agent/session_activity.py), so a
+ *  worker whose stamp is older than this is finished or stalled. Wider
+ *  than ACTIVE_WINDOW_S to bridge one missed heartbeat. */
+const WORKER_ACTIVE_WINDOW_S = 150
+
+/** True while this bot's freshest kanban/tool worker looks alive. Workers
+ *  never surface in conversation lists, so without this a profile grinding
+ *  through a 30-minute kanban task reads idle ("3 hr ago") the whole time
+ *  (hermes-agent#90268). Older gateways omit worker_session — always false. */
+function workerActiveAt(bot, now = Date.now()) {
+  const ts = bot?.worker_session?.last_active || 0
+  return Boolean(ts && now / 1000 - ts < WORKER_ACTIVE_WINDOW_S)
+}
+
 /** Bots that are working right now: the profile the gateway is running a
- *  turn for (busy), plus any bot whose last message landed inside the
- *  liveness window. Pure — output follows the input roster's order, so
- *  presence never reorders or hides the normal list. */
+ *  turn for (busy), any bot whose last message landed inside the liveness
+ *  window, plus any bot with a live kanban/tool worker. Pure — output
+ *  follows the input roster's order, so presence never reorders or hides
+ *  the normal list. */
 function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
   return (roster || []).filter(bot => {
     const busyTurn = !bot.remoteSource && bot.name === activeProfile && gatewayState === 'busy'
-    const last = bot.last_session?.last_active || 0
+    const last = botActivitySession(bot)?.last_active || 0
     const inWindow = Boolean(last && now / 1000 - last < ACTIVE_WINDOW_S)
 
-    return busyTurn || inWindow
+    return busyTurn || inWindow || workerActiveAt(bot, now)
   })
 }
 
@@ -4203,30 +6864,56 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const activeProfile = useValue(host.state.profile)
+  const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
+  const activeGroup = useValue($groupChatWorkspace)
   const meta = botRosterMeta(bot, useValue($botMeta))
   const groups = botGroups(meta)
   const last = bot.last_session
-  const isActive = !bot.remoteSource && bot.name === activeProfile
+  // Highlight follows the chat on screen (focused session's owner), not the
+  // gateway socket's home — a focused tab doesn't swap the socket, and on the
+  // old keying the wrong bot stayed highlighted while you read another's chat.
+  // A selected group chat suppresses every bot-row highlight: the group row
+  // owns the selection then (#88979).
+  const activeConnectionId = String(host.state.connectionId?.get?.() || 'local').trim()
+  const isActive = !activeGroup && isActiveRosterBot(bot, focusedOwner)
+  // Turn-busy is a SOCKET fact: only the gateway-home profile can be mid-turn.
+  const isGatewayHome = !bot.remoteSource && bot.name === activeProfile &&
+    isActiveRosterBot(bot, { name: activeProfile, connectionId: activeConnectionId })
   const { shape, color, image } = botAppearance(bot.name, meta)
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const gatewayState = useValue(host.state.gateway)
-  const activeNow = Boolean(last?.last_active && Date.now() / 1000 - last.last_active < ACTIVE_WINDOW_S)
+  // Preview identity must match click identity (#88200): when the backend
+  // resolved the pinned canonical chat, preview THAT session — not the
+  // profile's most recent (but unrelated) activity. Activity signals
+  // (age label, pulse dot) follow the same rule via botActivitySession:
+  // the canonical Bot Chat is hidden from last_session, so keying age off
+  // last_session alone shows "6d ago" on a bot you just messaged.
+  const previewSession = bot.canonical_session || last
+  const activitySession = botActivitySession(bot)
+  // A live kanban/tool worker counts as activity (#90268): pulse + fresh
+  // age while it runs, falling back to chat activity when it ends.
+  const workerActive = workerActiveAt(bot)
+  const activeNow =
+    workerActive ||
+    Boolean(activitySession?.last_active && Date.now() / 1000 - activitySession.last_active < ACTIVE_WINDOW_S)
+  const rowAgeTs = workerActive
+    ? Math.max(activitySession?.last_active || 0, bot.worker_session?.last_active || 0)
+    : activitySession?.last_active || 0
   // Work pose only when this bot is actually doing something: the active
   // profile while the gateway is busy, or a bot that wrote within the
   // liveness window. Not every bot whenever the gateway is busy.
-  const botMood = (isActive && gatewayState === 'busy') || activeNow ? 'work' : 'idle'
+  const botMood = (isGatewayHome && gatewayState === 'busy') || activeNow ? 'work' : 'idle'
   // Subscribe on every render. A source switch turns the same keyed row from
   // thin to rich; conditionally calling useValue here breaks React hook order.
   const unreadByName = useValue($botUnread)
-  const unread = !bot.remoteSource && Boolean(unreadByName[bot.name])
+  const unread = Boolean(unreadByName[botSelectionKey(bot)])
   // WHO sent the last message (bot-to-bot DM vs human) — the full stored
-  // history lives in the Sessions workspace (context menu), not inline.
+  // history lives in the canonical chat, not inline.
   // Preview identity must match click identity (#88200): when the backend
   // resolved the pinned canonical chat, preview THAT session — not the
   // profile's most recent (but unrelated) activity. Liveness checks above
   // keep last_session semantics: any recent activity means the bot is alive.
-  const previewSession = bot.preferred_session || last
   const { fromBot } = previewKind(previewSession?.preview)
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const displayPreview = stripPreviewMarkdown(
@@ -4259,50 +6946,56 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   }
 
   const open = async () => {
+    const generation = ++botOpenGeneration
     haptic('tap')
-    $selectedBot.set(bot.name)
+    $groupChatWorkspace.set(null)
+    $selectedBot.set(botSelectionKey(bot))
 
-    if (bot.remoteSource) {
-      const handle = botHandle(bot.name, bot)
-      host.notify?.({
-        kind: 'info',
-        title: displayName(bot),
-        message: `Stay in this chat and @${handle} to message them. Gateway stays on this device.`
-      })
-      return
-    }
-
-    let pinnedChat = meta?.chat
-
-    if (!bot.remoteSource && $botUnread.get()[bot.name]) {
+    if ($botUnread.get()[botSelectionKey(bot)]) {
       const next = { ...$botUnread.get() }
-      delete next[bot.name]
+      delete next[botSelectionKey(bot)]
       $botUnread.set(next)
     }
 
-    // Activate the owner first so every canonical-chat RPC lands on the
-    // backend that owns this bot's state database.
+    // Refresh through the immutable owner route. Foreground activation is
+    // presentation state and is never routing authority for this open.
     try {
-      pinnedChat = await prepareBotSource(bot, pinnedChat)
+      await prepareBotSource(bot)
     } catch (error) {
       host.notifyError?.(error, `Could not reach ${bot.connectionLabel || 'the remote source'}`)
 
       return
     }
 
-    try {
-      const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
+    if (generation !== botOpenGeneration) {
+      return
+    }
 
-      if (id) {
+    try {
+      // Identity is the NAMED registry row (profile → session titled
+      // "Bot Chat") on the bot's own source, resolved fresh on every click —
+      // preview identity and click identity agree because both describe that
+      // same row (#88200).
+      const id = await openBotCanonicalChat(bot)
+
+      if (generation === botOpenGeneration && id) {
         return
       }
-    } catch {
-      // Fall through to the older-gateway draft below.
+    } catch (error) {
+      if (generation === botOpenGeneration) {
+        host.notifyError?.(error, `Could not open ${displayName(bot, meta)}'s chat — try again`)
+      }
+
+      return
+    }
+
+    if (generation !== botOpenGeneration) {
+      return
     }
 
     if (typeof host.newChat === 'function') {
       // Older gateway without profile-scoped session.create — plain draft.
-      host.newChat(bot.name)
+      newBotChat(bot)
     } else {
       host.navigate('/')
     }
@@ -4349,19 +7042,22 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                       })
                     : null,
                   jsx('span', {
-                    className: 'truncate text-[0.8125rem] font-medium',
+                    className: cn(
+                      'truncate text-[0.8125rem] font-medium',
+                      bot.remoteSource && 'max-w-[42%] shrink-0'
+                    ),
                     children: displayName(bot, meta)
                   }),
                   showsHandle(bot.name, meta, bot)
                     ? jsx('span', {
-                        className: 'shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
+                        className: 'min-w-0 truncate font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
                         children: `@${botHandle(bot.name, bot)}`
                       })
                     : null,
                   bot.remoteSource
                     ? jsx('span', {
                         className:
-                          'shrink-0 rounded bg-(--chrome-action-hover) px-1 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                          'max-w-[28%] shrink-0 truncate rounded bg-(--chrome-action-hover) px-1 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
                         title: `Lives on ${bot.connectionLabel}`,
                         children: bot.connectionLabel
                       })
@@ -4377,13 +7073,13 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
               activeNow
                 ? jsx('span', {
                     className: 'hermes-bots-pulse size-1.5 shrink-0 rounded-full bg-(--ui-accent,#4f9cf9)',
-                    title: 'Active in the last 90s'
+                    title: workerActive ? 'Working on a task right now' : 'Active in the last 90s'
                   })
                 : null,
-              last
+              rowAgeTs
                 ? jsx('span', {
                     className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: relativeTime(last.last_active * 1000)
+                    children: relativeTime(rowAgeTs * 1000)
                   })
                 : null
             ]
@@ -4412,14 +7108,6 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     ]
   })
 
-  // Thin rows from another source are navigation targets only. Their profile
-  // metadata is not loaded yet, so edit/delete/pin/group actions would mutate
-  // whichever backend happens to be active. A normal click activates the
-  // owner; the refreshed rich row then exposes the full context menu.
-  if (bot.remoteSource) {
-    return row
-  }
-
   return jsxs(ContextMenu, {
     children: [
       jsx(ContextMenuTrigger, { asChild: true, children: row }),
@@ -4427,51 +7115,50 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
         children: [
           jsx(ContextMenuItem, {
             onSelect: () => {
-              const pinned = Boolean($botMeta.get()[bot.name]?.pinned)
-              saveBotMeta(bot.name, { pinned: !pinned })
-              host.notify({
-                kind: 'info',
-                message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : 'pinned to top'}`
-              })
+              void ensureBotMetadata(bot).then(current => {
+                const pinned = Boolean(current.pinned)
+                void saveBotMeta(bot, { pinned: !pinned })
+                host.notify({
+                  kind: 'info',
+                  message: `${displayName(bot, current)} ${pinned ? 'unpinned' : 'pinned to top'}`
+                })
+              }).catch(error => host.notifyError?.(error, 'Could not load bot metadata'))
             },
             children: meta?.pinned ? 'Unpin' : 'Pin to top'
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
-              const hidden = Boolean($botMeta.get()[bot.name]?.hidden)
-              // `hidden: false` (not null) so unhide round-trips through the
-              // server ui_meta merge the same way the local merge sees it.
-              saveBotMeta(bot.name, { hidden: !hidden })
+              void ensureBotMetadata(bot).then(current => {
+                const hidden = Boolean(current.hidden)
+                void saveBotMeta(bot, { hidden: !hidden })
 
-              if (!hidden) {
-                fallbackSelectionAfterHide(bot.name)
-              }
+                if (!hidden) {
+                  fallbackSelectionAfterHide(botSelectionKey(bot))
+                }
 
-              host.notify({
-                kind: 'info',
-                message: hidden
-                  ? `${displayName(bot, meta)} is back in the roster`
-                  : `${displayName(bot, meta)} hidden — use the eye button in the Bots header to see hidden bots`
-              })
+                host.notify({
+                  kind: 'info',
+                  message: hidden
+                    ? `${displayName(bot, current)} is back in the roster`
+                    : `${displayName(bot, current)} hidden — use the eye button in the Bots header to see hidden bots`
+                })
+              }).catch(error => host.notifyError?.(error, 'Could not load bot metadata'))
             },
             children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
-            onSelect: () => openBotSessionsWorkspace(bot),
-            children: 'Sessions'
+            onSelect: () => void ensureBotMetadata(bot).then(() => onEdit(bot)).catch(error => host.notifyError?.(error, 'Could not load bot')),
+            children: 'Edit Profile'
           }),
-          jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: 'Edit Profile' }),
-          !bot.remoteSource
-            ? jsx(ContextMenuItem, {
-                onSelect: () => onGroup(bot),
-                children: groups.length ? `Groups: ${groups.join(', ')}…` : 'Manage groups…'
-              })
-            : null,
+          jsx(ContextMenuItem, {
+            onSelect: () => void ensureBotMetadata(bot).then(() => onGroup(bot)).catch(error => host.notifyError?.(error, 'Could not load bot groups')),
+            children: groups.length ? `Groups: ${groups.join(', ')}…` : 'Manage groups…'
+          }),
           jsx(ContextMenuItem, {
             onSelect: () => {
               host.notify({ kind: 'info', message: `Duplicating ${displayName(bot, meta)}…` })
-              duplicateBot(bot, $lastRoster.get().filter(candidate => !candidate.remoteSource))
+              duplicateBot(bot, $lastRoster.get())
                 .then(name => {
                   queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
                   host.notify({ kind: 'success', message: `Created ${name} — full copy of ${bot.name}` })
@@ -4483,16 +7170,16 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
             onSelect: () => {
-              $selectedBot.set(bot.name)
+              $selectedBot.set(botSelectionKey(bot))
 
               if (typeof host.newChat === 'function') {
-                host.newChat(bot.name)
+                newBotChat(bot)
               }
             },
             children: 'New chat with this agent'
           }),
-          bot.is_default ? null : jsx(ContextMenuSeparator, {}),
-          bot.is_default
+          isDefaultBot(bot) ? null : jsx(ContextMenuSeparator, {}),
+          isDefaultBot(bot)
             ? null
             : jsx(ContextMenuItem, {
                 onSelect: () => onDelete(bot),
@@ -4507,10 +7194,16 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
 
 // ── model picker (provider/model dropdowns via model.options) ───────────────
 
-function useModelOptions() {
+function useModelOptions(bot = null) {
+  const route = botConnectionRoute(bot)
+
   return useQuery({
-    queryKey: [ID, 'model-options'],
-    queryFn: () => host.request('model.options', { include_unconfigured: true, explicit_only: false, refresh: true }),
+    queryKey: [ID, 'model-options', route ? botRouteKey(route) : 'active'],
+    queryFn: () => requestForBot(bot, 'model.options', {
+      include_unconfigured: true,
+      explicit_only: false,
+      refresh: true
+    }),
     staleTime: 120000,
     retry: false
   })
@@ -4521,8 +7214,8 @@ function useModelOptions() {
  * same data the core model picker shows. `value = {provider, model}`;
  * onChange receives the merged patch.
  */
-function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) {
-  const { data, isLoading, error } = useModelOptions()
+function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway default' }) {
+  const { data, isLoading, error } = useModelOptions(bot)
 
   // Hooks are ALWAYS declared up front, before any conditional return.
   // Declaring them after a return trips React error #310.
@@ -4714,12 +7407,15 @@ function AdvancedProfileConfig({ bot, state, setState }) {
   const [loaded, setLoaded] = useState(false)
   const [unsupported, setUnsupported] = useState(false)
   const [skillFilter, setSkillFilter] = useState('')
+  const botRoute = botConnectionRoute(bot)
+  const backendProfile = botRoute?.targetProfile || botRoute?.profile || bot.name
+  const backendScope = botBackendProfileScope(botRoute, bot.name)
 
   if (!loaded) {
     setLoaded(true)
     Promise.all([
-      host.request('profiles.describe', { name: bot }),
-      host.request('mcp.catalog', { profile: bot }).catch(() => null)
+      requestForBot(bot, 'profiles.describe', { name: bot.name }),
+      requestForBot(bot, 'mcp.catalog', { profile: bot.name }).catch(() => null)
     ])
       .then(([res, cat]) => {
         const configured = res.mcp_servers || []
@@ -4801,11 +7497,12 @@ function AdvancedProfileConfig({ bot, state, setState }) {
   // Render THAT instead of the checkbox stand-ins; writes go straight to the
   // bot's backend, so the dirty-section staging below only carries
   // model + SOUL on these builds. Older builds keep the full checklist UI.
-  if (SkillsView) {
+  if (SkillsView && (!botRoute || skillsViewRoutesConnections)) {
     return jsxs('div', {
       className: 'grid gap-4',
       children: [
         jsx(ModelPicker, {
+          bot,
           value: { provider: state.provider, model: state.model },
           onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
         }),
@@ -4814,9 +7511,38 @@ function AdvancedProfileConfig({ bot, state, setState }) {
           jsx('div', {
             className: 'overflow-hidden rounded-md border border-(--ui-stroke-secondary)',
             style: { height: 460, minHeight: 300, resize: 'vertical', overflow: 'auto' },
-            children: jsx(SkillsView, { embedded: true, fixedProfile: bot })
+            children: jsx(SkillsView, {
+              embedded: true,
+              fixedProfile: backendProfile,
+              ...(botRoute ? { fixedConnection: botRoute.connectionId } : {})
+            })
           })
         ),
+        labeled(
+          'SOUL.md (persona + agent-messaging protocol)',
+          jsx(Textarea, {
+            className: 'min-h-28 font-mono text-xs leading-5',
+            value: state.soul,
+            onChange: event => setState(prev => ({ ...prev, dirtySoul: true, soul: event.target.value }))
+          })
+        )
+      ]
+    })
+  }
+
+  if (bot?.sourceScoped && botRoute?.mode === 'remote' && !skillsViewRoutesConnections) {
+    return jsxs('div', {
+      className: 'grid gap-4',
+      children: [
+        jsx(ModelPicker, {
+          bot,
+          value: { provider: state.provider, model: state.model },
+          onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
+        }),
+        jsx('div', {
+          className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-text-tertiary)',
+          children: 'Remote capabilities require a newer desktop. Model and SOUL changes remain staged until you save.'
+        }),
         labeled(
           'SOUL.md (persona + agent-messaging protocol)',
           jsx(Textarea, {
@@ -4833,6 +7559,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
     className: 'grid gap-4',
     children: [
       jsx(ModelPicker, {
+        bot,
         value: { provider: state.provider, model: state.model },
         onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
       }),
@@ -4853,7 +7580,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
               children: jsx(CheckList, { items: visibleSkills, onToggle: toggleSkill, columns: 2 })
             }),
             jsx(HubSkillsSection, {
-              forProfile: bot,
+              forProfile: backendScope,
               onInstalled: name =>
                 setState(prev =>
                   prev.skills.some(s => s.name === name)
@@ -4895,7 +7622,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
                       ToolsetConfigPanel
                         ? jsx('div', {
                             className: 'mt-1.5 border-t border-(--ui-stroke-secondary) pt-1.5',
-                            children: jsx(ToolsetConfigPanel, { toolset: tset.name, profile: bot })
+                            children: jsx(ToolsetConfigPanel, { toolset: tset.name, profile: backendScope })
                           })
                         : null
                     ]
@@ -4918,7 +7645,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
           children: McpTab && typeof host.getGateway === 'function'
             ? jsx('div', {
                 style: { minHeight: 220, maxHeight: 360 },
-                children: jsx(McpTab, { gateway: host.getGateway(), profile: bot })
+                children: jsx(McpTab, { gateway: host.getGateway(), profile: backendScope })
               })
             : mcpList.length === 0
               ? jsx('div', {
@@ -4954,7 +7681,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
                                   : null,
                                 needsSetup
                                   ? jsx(McpSetupButton, {
-                                      profile: bot,
+                                      profile: backendScope,
                                       entry: m,
                                       onDone: () => toggleMcp(m.name, true)
                                     })
@@ -5272,11 +7999,11 @@ function emptyAdvancedState() {
 
 /** Persist only the dirty sections of the advanced editor. */
 async function applyAdvancedConfig(bot, state) {
-  const payload = { name: bot }
+  const payload = { name: bot.name }
   const applied = {}
 
   if (state.dirtySoul) {
-    payload.soul = ensureMessagingProtocol(state.soul, bot, $lastRoster.get())
+    payload.soul = ensureMessagingProtocol(state.soul, bot.name, $lastRoster.get())
   }
 
   if (state.dirtyModel) {
@@ -5288,8 +8015,8 @@ async function applyAdvancedConfig(bot, state) {
       payload.provider = provider
     } else if (!model && !provider) {
       try {
-        const result = await host.request('cli.exec', {
-          argv: ['--profile', bot, 'config', 'unset', 'model']
+        const result = await requestForBot(bot, 'cli.exec', {
+          argv: ['--profile', bot.name, 'config', 'unset', 'model']
         })
         applied.model = result?.blocked !== true && result?.code === 0
       } catch {
@@ -5319,7 +8046,7 @@ async function applyAdvancedConfig(bot, state) {
     return { ok: Object.values(applied).every(Boolean), applied }
   }
 
-  const result = await host.request('profiles.configure', payload)
+  const result = await requestForBot(bot, 'profiles.configure', payload)
   const merged = { ...applied, ...(result?.applied || {}) }
 
   return { ...result, ok: Object.values(merged).every(Boolean), applied: merged }
@@ -5342,7 +8069,7 @@ function labeled(label, control) {
 
 function EditProfileDialog({ bot, open, onClose }) {
   const metaAll = useValue($botMeta)
-  const meta = bot ? metaAll[bot.name] : null
+  const meta = bot ? botRosterMeta(bot, metaAll) : null
   const appearance = bot ? botAppearance(bot.name, meta) : { shape: 'circle', color: AVATAR_COLORS[3] }
   const [shape, setShape] = useState(appearance.shape)
   const [color, setColor] = useState(appearance.color)
@@ -5355,7 +8082,7 @@ function EditProfileDialog({ bot, open, onClose }) {
 
   // Re-seed local state each time a different bot opens the dialog.
   const [seedKey, setSeedKey] = useState(null)
-  const currentKey = bot ? `${bot.name}:${open}` : null
+  const currentKey = bot ? `${botSelectionKey(bot)}:${open}` : null
   if (currentKey !== seedKey) {
     setSeedKey(currentKey)
     if (bot && open) {
@@ -5381,7 +8108,7 @@ function EditProfileDialog({ bot, open, onClose }) {
 
     setBusy(true)
     let advancedFailed = false
-    const persistence = await saveBotMeta(bot.name, {
+    const persistence = await saveBotMeta(bot, {
       shape,
       color,
       image,
@@ -5404,7 +8131,7 @@ function EditProfileDialog({ bot, open, onClose }) {
     const desc = description.trim()
     if (desc !== (bot.description || '').trim()) {
       try {
-        await host.request('cli.exec', {
+        await requestForBot(bot, 'cli.exec', {
           argv: ['profile', 'describe', bot.name, '--text', desc]
         })
         queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
@@ -5415,7 +8142,7 @@ function EditProfileDialog({ bot, open, onClose }) {
 
     if (adv.loaded && (adv.dirtyModel || adv.dirtySoul || adv.dirtySkills || adv.dirtyToolsets || adv.dirtyMcp)) {
       try {
-        const res = await applyAdvancedConfig(bot.name, adv)
+        const res = await applyAdvancedConfig(bot, adv)
         const failed = Object.entries(res?.applied || {}).filter(([, ok]) => !ok)
 
         if (failed.length) {
@@ -5497,7 +8224,7 @@ function EditProfileDialog({ bot, open, onClose }) {
             advanced
               ? jsx('div', {
                   className: 'rounded-md border border-(--ui-stroke-secondary) p-3',
-                  children: jsx(AdvancedProfileConfig, { bot: bot.name, state: adv, setState: setAdv })
+                  children: jsx(AdvancedProfileConfig, { bot, state: adv, setState: setAdv })
                 })
               : null
           ]
@@ -5528,7 +8255,9 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const flightRef = useRef(null)
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
-  const [shape, setShape] = useState('circle')
+  // Default shapes mode: deterministic blob face drawn from the agent's name
+  // (falls back to the legacy shape vocabulary on older SDKs).
+  const [shape, setShape] = useState(blobatarSvg ? 'blobatar' : 'circle')
   const [color, setColor] = useState(AVATAR_COLORS[3])
   const [image, setImage] = useState(null)
   const [advanced, setAdvanced] = useState(false)
@@ -5553,7 +8282,10 @@ function CreateAgentDialog({ open, onClose, roster }) {
 
     host
       .connections()
-      .then(value => setConnections(Array.isArray(value) ? value : []))
+      // host.connections() returns the registry ROWS on current SDKs, but the
+      // envelope object ({version, primary, connections: [...]}) on desktops
+      // that predate the SDK-side unwrap — accept both shapes.
+      .then(value => setConnections(Array.isArray(value) ? value : Array.isArray(value?.connections) ? value.connections : []))
       .catch(() => setConnections([]))
   }, [open, connections])
 
@@ -5625,7 +8357,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
     setName('')
     setTitle('')
     setDescription('')
-    setShape('circle')
+    setShape(blobatarSvg ? 'blobatar' : 'circle')
     setColor(AVATAR_COLORS[3])
     setImage(null)
     setAdvanced(false)
@@ -5930,7 +8662,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
                       setTargetConnection(value === (activeConnectionId || 'local') ? '' : value)
                       // The capability catalog and clone list belong to the
                       // target backend — refetch for the new home. The live
-                      // Capabilities tab only exists for the active gateway.
+                      // Capabilities tab re-pins to it via fixedConnection on
+                      // builds that route it (staged checklists otherwise).
                       setCaps(null)
                       setCapsFailed(false)
                       setAdvTab('general')
@@ -6008,10 +8741,13 @@ function CreateAgentDialog({ open, onClose, roster }) {
                       // Newer desktops export the whole Capabilities surface —
                       // one live tab replaces the three staged checklists.
                       // The live Capabilities surface (SkillsView) binds to
-                      // the ACTIVE gateway's backend — a remote-target draft
-                      // lives elsewhere, so it keeps the staged checklists
-                      // (their catalog reads already route to the target).
-                      children: (SkillsView && !remoteTarget
+                      // the ACTIVE gateway's backend unless this build routes
+                      // fixedConnection (skillsViewRoutesConnections) — then a
+                      // remote-target draft gets the live surface pinned to
+                      // ITS machine. Builds without that routing keep the
+                      // staged checklists for remote targets (their catalog
+                      // reads already route to the target).
+                      children: (SkillsView && (!remoteTarget || skillsViewRoutesConnections)
                         ? [
                             ['general', 'General'],
                             ['capabilities', 'Capabilities']
@@ -6154,9 +8890,15 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                 style: { height: 440, minHeight: 280, resize: 'vertical', overflow: 'auto' },
                                 // The REAL core Capabilities surface (skills +
                                 // one-click hub installs + tools + MCP), pinned
-                                // to the just-created profile. Writes land
+                                // to the just-created profile — and, for a
+                                // remote-target draft, to the target machine's
+                                // backend via fixedConnection. Writes land
                                 // immediately — no staging needed.
-                                children: jsx(SkillsView, { embedded: true, fixedProfile: createdForCaps })
+                                children: jsx(SkillsView, {
+                                  embedded: true,
+                                  fixedProfile: createdForCaps,
+                                  ...(remoteTarget ? { fixedConnection: targetConnection } : {})
+                                })
                               })
                       : capsFailed
                         ? jsx('div', {
@@ -6379,13 +9121,15 @@ function isLegacyDelegatedRoutine(job) {
   return Boolean(routineBot(job) && typeof preview === 'string' && preview.startsWith(LEGACY_DELEGATED_ROUTINE_PREFIX))
 }
 
-async function loadRoutines(profile) {
+async function loadRoutines(owner) {
+  const bot = typeof owner === 'string' ? { name: owner } : owner
+  const profile = String(bot?.name || '').trim()
   // profile scopes cron.manage to that bot's own cron store (core RPC gained an
   // optional `profile` param). Older gateways ignore the unknown param and
   // return the launch-profile store — the [bot:] tag filter in selectRoutineJobs
   // remains the graceful fallback there.
   const scope = profile ? { profile } : {}
-  const data = await host.request('cron.manage', { action: 'list', include_disabled: true, ...scope })
+  const data = await requestForBot(bot, 'cron.manage', { action: 'list', include_disabled: true, ...scope })
   const jobs = Array.isArray(data?.jobs) ? data.jobs : []
   const activeLegacyJobs = jobs.filter(
     job => isLegacyDelegatedRoutine(job) && job.enabled !== false && job.state !== 'paused'
@@ -6398,8 +9142,7 @@ async function loadRoutines(profile) {
   // actually paused, and the next poll retries the rest.
   const pauses = await Promise.all(
     activeLegacyJobs.map(job =>
-      host
-        .request('cron.manage', { action: 'pause', name: job.job_id, ...scope })
+      requestForBot(bot, 'cron.manage', { action: 'pause', name: job.job_id, ...scope })
         .then(() => true)
         .catch(() => false)
     )
@@ -6416,10 +9159,15 @@ async function loadRoutines(profile) {
   }
 }
 
-function useRoutines(profile) {
+function useRoutines(owner) {
+  const bot = typeof owner === 'string' ? { name: owner } : owner
+  const route = botConnectionRoute(bot)
+  const key = route ? botRosterKey(bot) : bot?.name || ''
+
   return useQuery({
-    queryKey: [...ROUTINES_KEY, profile || ''],
-    queryFn: () => loadRoutines(profile),
+    queryKey: [...ROUTINES_KEY, key],
+    queryFn: () => loadRoutines(bot),
+    enabled: Boolean(bot?.name),
     refetchInterval: 20000,
     staleTime: 8000
   })
@@ -6429,9 +9177,13 @@ function routineCreateTarget(owner, activeBot) {
   return owner || activeBot
 }
 
-async function invalidateRoutineOwner(profile) {
+async function invalidateRoutineOwner(owner) {
+  const bot = typeof owner === 'string' ? { name: owner } : owner
+  const route = botConnectionRoute(bot)
+  const key = route ? botRosterKey(bot) : bot?.name || ''
+
   await queryClient.invalidateQueries({
-    queryKey: [...ROUTINES_KEY, profile || ''],
+    queryKey: [...ROUTINES_KEY, key],
     exact: true
   })
 }
@@ -6472,13 +9224,6 @@ function normalizedProfileName(profile) {
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\"'\"'")}'`
-}
-
-/** Escape for interpolation INSIDE an existing double-quoted shell string:
- *  keeps ", `, $, and \ literal so free-text titles (which sync from ui_meta)
- *  and gateway profile names can't expand or break out of the quotes. */
-function shellDoubleQuote(value) {
-  return String(value).replace(/[\\"`$]/g, ch => '\\' + ch)
 }
 
 function routineInputError(title, instruction) {
@@ -6539,7 +9284,8 @@ function scheduleLabel(schedule) {
   return schedule || ''
 }
 
-function RoutineRow({ job, profile }) {
+function RoutineRow({ job, owner }) {
+  const profile = typeof owner === 'string' ? owner : owner?.name
   const [busy, setBusy] = useState(false)
   // Optimistic overlay: null = trust server state. Set immediately on
   // toggle so the switch responds even before the refetch lands.
@@ -6564,8 +9310,8 @@ function RoutineRow({ job, profile }) {
     }
 
     try {
-      await host.request('cron.manage', { action, name: job.job_id, ...(profile ? { profile } : {}) })
-      await invalidateRoutineOwner(profile)
+      await requestForBot(owner, 'cron.manage', { action, name: job.job_id, ...(profile ? { profile } : {}) })
+      await invalidateRoutineOwner(owner)
     } catch (err) {
       setPendingActive(null)
       host.notifyError(err, 'Cronjob update failed')
@@ -6845,9 +9591,15 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   const [instruction, setInstruction] = useState('')
   const [sched, setSched] = useState(defaultScheduleState())
   const [continuity, setContinuity] = useState(false)
+  // Where the run's output lands: 'history' = the run session only (Run
+  // history / cron page, today's behavior); 'bot-chat' = inject into this
+  // bot's canonical Bot Chat as a real message — the bot reads it, acts on
+  // it, and responds there (costs the bot one agent turn per run).
+  const [target, setTarget] = useState('history')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const activeProfile = useValue(host.state.profile)
+  const profile = typeof bot === 'string' ? bot : bot?.name
   const schedule = composeSchedule(sched)
 
   const reset = () => {
@@ -6855,6 +9607,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
     setInstruction('')
     setSched(defaultScheduleState())
     setContinuity(false)
+    setTarget('history')
     setBusy(false)
     setError(null)
   }
@@ -6881,14 +9634,18 @@ function CreateRoutineDialog({ bot, open, onClose }) {
         sched.freq !== 'once' && sched.freq !== 'advanced' && String(sched.repeatN || '').trim()
           ? Math.max(1, parseInt(sched.repeatN, 10) || 1)
           : null
-      await host.request('cron.manage', {
+      await requestForBot(bot, 'cron.manage', {
         action: 'add',
-        name: `[bot:${bot}] ${title}`,
+        name: `[bot:${profile}] ${title}`,
         schedule: schedule.trim(),
-        prompt: routinePrompt(bot, title, task, activeProfile),
-        ...(bot ? { profile: bot } : {}),
+        prompt: routinePrompt(profile, title, task, activeProfile),
+        ...(profile ? { profile } : {}),
         ...(repeatN ? { repeat: repeatN } : {}),
-        ...(continuity ? { continuity: true } : {})
+        ...(continuity ? { continuity: true } : {}),
+        // 'bot-chat' (bare, no name): the job is created IN the bot's own
+        // cron store (profile scoping above), so the scheduler resolves the
+        // token to that profile — no cross-gateway name ambiguity possible.
+        ...(target === 'bot-chat' ? { deliver: 'bot-chat' } : {})
       })
       await invalidateRoutineOwner(bot)
       host.notify({ kind: 'success', message: `Cronjob "${title}" scheduled` })
@@ -6915,7 +9672,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
           children: [
             jsx(DialogTitle, { children: 'New Cronjob' }),
             jsx(DialogDescription, {
-              children: `A recurring task ${displayName({ name: bot }, $botMeta.get()[bot])} runs on a schedule. Runs land in its own chat history.`
+              children: `A recurring task ${displayName(typeof bot === 'string' ? { name: bot } : bot, botRosterMeta(bot, $botMeta.get()))} runs on a schedule. Runs land in its own chat history.`
             })
           ]
         }),
@@ -6941,6 +9698,13 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               })
             ),
             labeled('When to run', jsx(SchedulePicker, { state: sched, setState: setSched })),
+            labeled(
+              'Send results to',
+              pickerSelect(target, setTarget, [
+                { id: 'history', label: 'Run history only' },
+                { id: 'bot-chat', label: `${displayName({ name: bot }, $botMeta.get()[bot])}\u2019s chat (bot responds)` }
+              ])
+            ),
             jsxs('label', {
               className: 'flex items-center gap-2 text-xs text-(--ui-text-tertiary) cursor-pointer select-none',
               children: [
@@ -6984,23 +9748,79 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   })
 }
 
+/** Keeps $selectedBot in sync with the focused chat's owner profile.
+ *  nanostores' `.listen()` never replays the current value the way
+ *  `.subscribe()` does, so a disable → profile switch → re-enable sequence
+ *  would otherwise leave $selectedBot pointed at whichever bot was active
+ *  before the plugin was disabled — reseeding here on every register() call
+ *  closes that gap. Connection qualification keeps same-named owners isolated.
+ *  Returns the unbind function for ctx.onDispose. */
+function bindProfileSync(ownerStore) {
+  const sync = owner => {
+    const profile = typeof owner === 'string' ? owner : owner?.profile
+
+    if (!profile || typeof profile !== 'string') {
+      return
+    }
+
+    const connectionId = String(
+      typeof owner === 'object' ? owner?.connectionId || '' : ''
+    ).trim()
+    $selectedBot.set(connectionId ? `${connectionId}::${profile}` : profile)
+  }
+
+  sync(ownerStore.get?.())
+
+  return ownerStore.listen(sync)
+}
+
+function resolveRoutineOwner(roster, focusedOwner, selected) {
+  if (hasFocusedSessionOwnerSupport && !focusedOwner) {
+    return null
+  }
+
+  const focusedBot = focusedOwner
+    ? roster.find(bot => isActiveRosterBot(bot, focusedOwner))
+    : null
+
+  if (focusedOwner?.authoritative) {
+    return focusedBot || null
+  }
+
+  const selectedBot = roster.find(bot => botSelectionKey(bot) === selected)
+  return focusedBot || selectedBot || (focusedOwner ? { name: focusedOwner.name } : null)
+}
+
 function RoutinesPane() {
   const selected = useValue($selectedBot)
-  const gatewayProfile = useValue(host.state.profile)
-  // The tile maps to the bot you're chatting with: the live gateway profile
-  // is the truth once a chat opens; $selectedBot covers the gap between a
-  // roster click and the profile swap landing.
-  const bot = (gatewayProfile || selected || 'default').trim() || 'default'
-  const meta = useValue($botMeta)[bot]
+  const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
+  // A complete focused owner is authoritative. If its exact roster row is
+  // absent, fail closed instead of routing cron reads/mutations through a
+  // stale selection or an unscoped profile name.
+  const owner = resolveRoutineOwner($lastRoster.get(), focusedOwner, selected)
+  const bot = String(owner?.name || focusedOwner?.name || 'default').trim() || 'default'
+  const allMeta = useValue($botMeta)
+  const meta = owner ? botRosterMeta(owner, allMeta) : null
   const { shape, color, image } = botAppearance(bot, meta)
-  const { data, error, isLoading, refetch } = useRoutines(bot)
+  const { data, error, isLoading, refetch } = useRoutines(owner)
   const [createOpen, setCreateOpen] = useState(false)
   const [createOwner, setCreateOwner] = useState(null)
-  const createTarget = routineCreateTarget(createOwner, bot)
+  const createTarget = owner ? routineCreateTarget(createOwner, bot) : null
 
   const openCreate = () => {
-    setCreateOwner(bot)
+    if (!owner) {
+      return
+    }
+
+    setCreateOwner(owner)
     setCreateOpen(true)
+  }
+
+  if (!owner) {
+    return jsx('div', {
+      className: 'flex h-full items-center justify-center px-4 text-center text-xs text-(--ui-text-tertiary)',
+      children: 'Cronjobs are unavailable until this agent appears in the roster.'
+    })
   }
 
   const view = selectRoutineJobs(data, error, $lastJobs.get(), bot)
@@ -7111,7 +9931,7 @@ function RoutinesPane() {
               className: 'min-h-0 flex-1',
               children: jsx('div', {
                 className: 'grid gap-1.5 px-2.5 py-2',
-                children: jobs.map(job => jsx(RoutineRow, { job, profile: bot }, job.job_id))
+                children: jobs.map(job => jsx(RoutineRow, { job, owner }, job.job_id))
               })
             }),
       jsx(CreateRoutineDialog, {
@@ -7124,153 +9944,6 @@ function RoutinesPane() {
         // key is the jsx() THIRD argument — as a prop it is silently ignored
         // and the dialog kept stale per-bot form state when the target changed.
       }, createTarget)
-    ]
-  })
-}
-
-// ── profile session workspace ────────────────────────────────────────────────
-
-const PROFILE_SESSION_LIST_LIMIT = 200
-
-function openBotSessionsWorkspace(bot) {
-  if (bot?.name && NAME_RE.test(bot.name)) {
-    $botSessionsWorkspace.set(bot.name)
-  }
-}
-
-function filterProfileSessions(sessions, query) {
-  const needle = String(query || '').trim().toLowerCase()
-  const rows = Array.isArray(sessions) ? sessions : []
-  if (!needle) return rows
-  return rows.filter(session =>
-    `${session?.title || ''} ${session?.preview || ''} ${session?.source || ''}`.toLowerCase().includes(needle)
-  )
-}
-
-function useProfileSessions(botName, gatewayGeneration) {
-  return useQuery({
-    queryKey: [ID, 'profile-sessions', botName, gatewayGeneration],
-    enabled: Boolean(botName),
-    // include_hidden: this browser exists precisely to see the profile's own
-    // (always-hidden) Bot Mode sessions alongside its regular ones.
-    queryFn: () => host.request('session.list', { profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true }),
-    refetchInterval: 8000,
-    staleTime: 4000,
-    retry: false
-  })
-}
-
-async function openProfileSession(botName, storedId, gatewayGeneration) {
-  const profile = String(botName || '')
-  const id = String(storedId || '')
-  if (!NAME_RE.test(profile) || !id || gatewayGeneration !== $sessionsGatewayGeneration.get()) return
-  if (typeof host.openSession !== 'function') {
-    throw new Error('This Hermes Desktop version cannot open stored sessions')
-  }
-  await host.openSession(id, { profile })
-  if (gatewayGeneration !== $sessionsGatewayGeneration.get()) return
-  $botSelectedSessions.set({ ...$botSelectedSessions.get(), [profile]: id })
-}
-
-function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
-  return jsxs('button', {
-    type: 'button',
-    'aria-current': active ? 'page' : undefined,
-    onClick: () => void openProfileSession(botName, session.id, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
-    className: cn(
-      'flex w-full flex-col gap-0.5 overflow-hidden rounded-md px-2 py-1.5 text-left transition-colors',
-      'hover:bg-(--chrome-action-hover)',
-      active && 'bg-(--ui-row-active-background)'
-    ),
-    children: [
-      jsx('span', {
-        className: 'truncate text-[0.8125rem] font-medium',
-        children: session.title || 'Untitled session'
-      }),
-      jsx('div', {
-        className: 'truncate text-[0.7rem] text-(--ui-text-tertiary)',
-        children: session.preview || session.source || 'No messages yet'
-      })
-    ]
-  })
-}
-
-function ProfileSessionsWorkspace({ bot }) {
-  const gatewayGeneration = useValue($sessionsGatewayGeneration)
-  const { data, isLoading, error } = useProfileSessions(bot.name, gatewayGeneration)
-  const selectedByProfile = useValue($botSelectedSessions)
-  const [query, setQuery] = useState('')
-  const sourceSessions = data?.sessions || []
-  const sessions = filterProfileSessions(sourceSessions, query)
-  const inventoryBounded = sourceSessions.length >= PROFILE_SESSION_LIST_LIMIT
-  const selectedId = selectedByProfile[bot.name] || ''
-
-  const header = jsxs('div', {
-    className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
-    children: [
-      jsx(Button, {
-        variant: 'ghost',
-        size: 'sm',
-        onClick: () => $botSessionsWorkspace.set(null),
-        children: 'Back'
-      }),
-      jsx('div', {
-        className: 'min-w-0 flex-1 truncate text-sm font-semibold',
-        children: `${displayName(bot, $botMeta.get()[bot.name])} sessions`
-      })
-    ]
-  })
-
-  return jsxs('div', {
-    className: 'flex h-full flex-col',
-    children: [
-      header,
-      jsx('div', {
-        className: 'px-2 pb-2',
-        children: jsx(Input, {
-          'aria-label': 'Filter sessions',
-          placeholder: 'Filter sessions…',
-          value: query,
-          onChange: event => setQuery(event.target.value)
-        })
-      }),
-      inventoryBounded
-        ? jsx('div', {
-            className: 'px-2.5 pb-2 text-[0.65rem] text-(--ui-text-quaternary)',
-            children: `Showing the ${PROFILE_SESSION_LIST_LIMIT} most recent sessions.`
-          })
-        : null,
-      isLoading
-        ? jsx('div', {
-            className: 'flex flex-1 items-center justify-center',
-            children: jsx(GlyphSpinner, { spinner: 'breathe' })
-          })
-        : error
-          ? jsx('div', {
-              className: 'px-3 py-3 text-xs text-(--ui-text-tertiary)',
-              children: 'Could not load sessions for this profile.'
-            })
-          : jsx(ScrollArea, {
-              className: 'min-h-0 flex-1',
-              children: jsx('div', {
-                className: 'grid gap-0.5 px-1.5 pb-2',
-                children: sessions.length
-                  ? sessions.map(session => jsx(ProfileSessionRow, {
-                      session,
-                      botName: bot.name,
-                      active: selectedId === session.id,
-                      gatewayGeneration
-                    }, session.id))
-                  : jsx('div', {
-                      className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                      children: query.trim()
-                        ? inventoryBounded
-                          ? `No matching sessions in the ${PROFILE_SESSION_LIST_LIMIT} most recent.`
-                          : 'No sessions match that filter.'
-                        : 'No stored sessions yet.'
-                    })
-              })
-            })
     ]
   })
 }
@@ -7300,7 +9973,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
         children: 'Active now'
       }),
       ...active.map(bot => {
-        const meta = metaByName?.[bot.name]
+        const meta = botRosterMeta(bot, metaByName)
         const { shape, color, image } = botAppearance(bot.name, meta)
         const photo = Boolean(image && !isBackfilledFacePng(image))
         const label = displayName(bot, meta)
@@ -7339,16 +10012,16 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
 function GroupDialog({ bot, onClose }) {
   const meta = useValue($botMeta)
   const [name, setName] = useState('')
-  const current = botGroups(meta[bot?.name])
+  const current = botGroups(botRosterMeta(bot, meta))
   const groups = knownGroups(meta)
 
   const setMembership = (group, enabled) => {
-    saveBotMeta(bot.name, groupMembershipPatch(meta[bot.name], group, enabled))
+    void saveBotMeta(bot, groupMembershipPatch(botRosterMeta(bot, meta), group, enabled))
     host.notify({
       kind: 'info',
       message: enabled
-        ? `${displayName(bot, meta[bot.name])} added to “${group}”`
-        : `${displayName(bot, meta[bot.name])} removed from “${group}”`
+        ? `${displayName(bot, botRosterMeta(bot, meta))} added to “${group}”`
+        : `${displayName(bot, botRosterMeta(bot, meta))} removed from “${group}”`
     })
   }
 
@@ -7420,10 +10093,175 @@ function GroupDialog({ bot, onClose }) {
               variant: 'ghost',
               size: 'sm',
               className: 'justify-self-start',
-              onClick: () => saveBotMeta(bot.name, { groups: [], group: null }),
+              onClick: () => void saveBotMeta(bot, { groups: [], group: null }),
               children: 'Remove from all groups'
             })
           : null
+      ]
+    })
+  })
+}
+
+/** Compact picture controls shared by group-chat creation and settings:
+ *  a live preview (image, else the organization glyph), Upload / Generate /
+ *  Remove. Reuses the bot-avatar pipeline (device picker, 256px normalize,
+ *  image.generate probe) so room pictures cost the same as bot avatars. */
+function GroupImageControls({ image, onImage, seedName, seedMembers }) {
+  const imagen = useValue($imagenAvailable)
+  const [busy, setBusy] = useState(false)
+
+  if (imagen === null) {
+    void probeImagen()
+  }
+
+  const upload = async () => {
+    const raw = await pickImageFromDevice()
+
+    if (raw) {
+      onImage(await normalizeAvatarImage(raw))
+    }
+  }
+
+  const generate = async () => {
+    if (busy) {
+      return
+    }
+
+    setBusy(true)
+
+    try {
+      const who = [seedName, seedMembers?.length ? `a team of ${seedMembers.join(', ')}` : '']
+        .filter(Boolean)
+        .join(' — ')
+      const res = await host.request('image.generate', {
+        prompt:
+          `Group chat icon for an AI agent team called "${who || 'a bot team'}". ` +
+          'Friendly minimal emblem, bold flat vector style, solid color background, centered, no text.',
+        aspect_ratio: 'square'
+      })
+
+      if (!res?.success) {
+        throw new Error(res?.error || 'generation failed')
+      }
+
+      const img = res.image_data || res.image
+
+      if (img) {
+        onImage(await normalizeAvatarImage(img))
+      }
+    } catch (err) {
+      host.notifyError(err, 'Group picture generation failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return jsxs('div', {
+    className: 'flex items-center gap-2',
+    children: [
+      jsx('div', {
+        className:
+          'flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-(--chrome-action-hover)',
+        children: image
+          ? jsx('img', { src: image, alt: '', className: 'size-full object-cover' })
+          : jsx(Codicon, { name: 'organization', className: 'text-(--ui-text-tertiary)' })
+      }),
+      jsx(Button, { type: 'button', variant: 'secondary', size: 'sm', onClick: upload, children: 'Upload' }),
+      imagen
+        ? jsx(Button, {
+            type: 'button',
+            variant: 'secondary',
+            size: 'sm',
+            disabled: busy,
+            onClick: generate,
+            children: busy ? 'Generating…' : 'Generate'
+          })
+        : null,
+      image
+        ? jsx(Button, { type: 'button', variant: 'ghost', size: 'sm', onClick: () => onImage(null), children: 'Remove' })
+        : null
+    ]
+  })
+}
+
+/** Edit an existing group chat's name and picture. Renames re-key the room
+ *  and every local member's membership (renameGroupChat); the picture rides
+ *  the room record. Both apply on Save so a cancelled dialog changes nothing. */
+function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
+  const rooms = useValue($groupChats)
+  const current = (rooms[group] || {}).image || null
+  const [name, setName] = useState(group)
+  const [image, setImage] = useState(current)
+
+  useEffect(() => {
+    if (open) {
+      setName(group)
+      setImage(current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, group])
+
+  const save = async () => {
+    const finalName = await renameGroupChat(group, name, members)
+
+    if (finalName === null) {
+      return // collision — dialog stays open for a different name
+    }
+
+    if (image !== current) {
+      setGroupChatImage(finalName, image)
+    }
+
+    onClose()
+
+    if (finalName !== group) {
+      onRenamed?.(finalName)
+    }
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Group settings' }),
+            jsx(DialogDescription, {
+              children: 'Rename the group or set a room picture. Members and history are kept.'
+            })
+          ]
+        }),
+        jsx(GroupImageControls, {
+          image,
+          onImage: setImage,
+          seedName: name.trim() || group,
+          seedMembers: (members || []).map(b => b.name)
+        }),
+        jsx('form', {
+          onSubmit: event => {
+            event.preventDefault()
+            void save()
+          },
+          children: jsx(Input, {
+            'aria-label': 'Group name',
+            autoFocus: true,
+            maxLength: 64,
+            value: name,
+            onChange: event => setName(event.target.value)
+          })
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
+            jsx(Button, { disabled: !name.trim(), onClick: () => void save(), children: 'Save' })
+          ]
+        })
       ]
     })
   })
@@ -7438,6 +10276,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const [query, setQuery] = useState('')
   const [checked, setChecked] = useState({})
   const [name, setName] = useState('')
+  const [image, setImage] = useState(null)
 
   // Reset per open so a cancelled draft doesn't leak into the next one.
   useEffect(() => {
@@ -7445,6 +10284,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       setQuery('')
       setChecked({})
       setName('')
+      setImage(null)
     }
   }, [open])
 
@@ -7457,9 +10297,9 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const canCreate = selected.length >= 2 && Boolean(name.trim() || selected.length)
 
   const create = () => {
-    let groupName = (name.trim() || placeholder).slice(0, 64)
+    const base = (name.trim() || placeholder).slice(0, 64)
 
-    if (selected.length < 2 || !groupName) {
+    if (selected.length < 2 || !base) {
       return
     }
 
@@ -7467,8 +10307,11 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
     // group under an existing name (easy — the default name is just the
     // member names) silently reopens the old room with its full log, which
     // reads as "not a fresh group" (db's Aug 2026 report). Uniquify against
-    // both live rooms and any bot's current grouping.
-    const taken = new Set(Object.keys($groupChats.get()))
+    // both live rooms and any bot's current grouping, then mint a fresh
+    // roomId: member sessions are titled by that roomId, so a
+    // disbanded-and-recreated group with the SAME display name still gets
+    // new sessions instead of resuming the old room's by title.
+    const taken = new Set(liveGroupChatNames())
 
     for (const meta of Object.values($botMeta.get() || {})) {
       for (const existing of botGroups(meta)) {
@@ -7476,20 +10319,11 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       }
     }
 
-    if (taken.has(groupName)) {
-      let n = 2
-
-      while (taken.has(`${groupName} ${n}`)) {
-        n += 1
-      }
-
-      groupName = `${groupName} ${n}`.slice(0, 64)
-    }
+    const groupName = uniqueGroupChatName(base, taken)
+    const roomId = mintGroupRoomId()
 
     for (const bot of selected) {
-      if (!bot.remoteSource) {
-        void saveBotMeta(bot.name, groupMembershipPatch(botRosterMeta(bot, allMeta), groupName, true))
-      }
+      void saveBotMeta(bot, groupMembershipPatch(botRosterMeta(bot, allMeta), groupName, true))
     }
 
     // Persist every machine identity, including today's active source. That
@@ -7499,6 +10333,12 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
 
     updateGroupChat(groupName, room => {
       room.members = roomMembers
+      room.roomId = roomId
+
+      if (image) {
+        room.image = image
+      }
+
       return room
     })
 
@@ -7603,18 +10443,29 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                 })
           })
         }),
-        jsx('form', {
-          onSubmit: event => {
-            event.preventDefault()
-            create()
-          },
-          children: jsx(Input, {
-            'aria-label': 'Group name',
-            maxLength: 64,
-            placeholder,
-            value: name,
-            onChange: event => setName(event.target.value)
-          })
+        jsxs('div', {
+          className: 'grid gap-2',
+          children: [
+            jsx(GroupImageControls, {
+              image,
+              onImage: setImage,
+              seedName: name.trim() || (selected.length ? placeholder : ''),
+              seedMembers: selected.map(bot => displayName(bot, botRosterMeta(bot, allMeta)))
+            }),
+            jsx('form', {
+              onSubmit: event => {
+                event.preventDefault()
+                create()
+              },
+              children: jsx(Input, {
+                'aria-label': 'Group name',
+                maxLength: 64,
+                placeholder,
+                value: name,
+                onChange: event => setName(event.target.value)
+              })
+            })
+          ]
         }),
         jsxs(DialogFooter, {
           children: [
@@ -7699,7 +10550,7 @@ function mentionTokenAt(text, caret) {
  *  the strings parseGroupChatMentions resolves. Keyboard: Up/Down navigate,
  *  Enter/Tab insert (Enter falls through to submit when the popover is
  *  closed), Escape dismisses. */
-function GroupMentionInput({ members, onChange, value, ...inputProps }) {
+function GroupMentionInput({ members, onChange, onSubmitDraft, value, ...inputProps }) {
   const allMeta = useValue($botMeta)
   const inputRef = useRef(null)
   const [token, setToken] = useState(null)
@@ -7716,14 +10567,26 @@ function GroupMentionInput({ members, onChange, value, ...inputProps }) {
 
     for (const member of members) {
       const handle = String(member.handle || botHandle(member.name, member) || '').trim()
+      const display = displayName(member, botRosterMeta(member, allMeta))
+      // Renamed members complete on their friendly tag; parser resolves both.
+      const tag = String(botMentionTag(member) || handle).trim()
 
-      if (!handle || (token.query && !handle.toLowerCase().startsWith(token.query))) {
+      if (!tag) {
+        continue
+      }
+
+      if (
+        token.query &&
+        !tag.toLowerCase().startsWith(token.query) &&
+        !(handle && handle.toLowerCase().startsWith(token.query)) &&
+        !display.toLowerCase().startsWith(token.query)
+      ) {
         continue
       }
 
       options.push({
-        handle,
-        meta: displayName(member, botRosterMeta(member, allMeta))
+        handle: tag,
+        meta: display
       })
     }
   }
@@ -7790,32 +10653,55 @@ function GroupMentionInput({ members, onChange, value, ...inputProps }) {
             )
           })
         : null,
-      jsx(Input, {
+      jsx(Textarea, {
         ...inputProps,
         ref: inputRef,
         value,
+        rows: 1,
+        // Multi-line room prompts (#89884): the composer was a single-line
+        // Input whose form submitted on every Enter — newlines were
+        // impossible. Enter (no Shift) still submits via onSubmitDraft;
+        // Shift+Enter falls through to the textarea's native newline.
+        className: cn('max-h-40 min-h-9 resize-none', inputProps.className),
         onChange: event => {
           onChange(event.target.value)
           refreshToken(event.target)
         },
         onClick: event => refreshToken(event.target),
         onKeyDown: event => {
-          if (!open) {
-            return
+          if (open) {
+            if (event.key === 'ArrowDown') {
+              event.preventDefault()
+              setSelected((active + 1) % options.length)
+
+              return
+            }
+
+            if (event.key === 'ArrowUp') {
+              event.preventDefault()
+              setSelected((active - 1 + options.length) % options.length)
+
+              return
+            }
+
+            if (event.key === 'Enter' || event.key === 'Tab') {
+              event.preventDefault()
+              insert(options[active].handle)
+
+              return
+            }
+
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              setToken(null)
+
+              return
+            }
           }
 
-          if (event.key === 'ArrowDown') {
+          if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault()
-            setSelected((active + 1) % options.length)
-          } else if (event.key === 'ArrowUp') {
-            event.preventDefault()
-            setSelected((active - 1 + options.length) % options.length)
-          } else if (event.key === 'Enter' || event.key === 'Tab') {
-            event.preventDefault()
-            insert(options[active].handle)
-          } else if (event.key === 'Escape') {
-            event.preventDefault()
-            setToken(null)
+            onSubmitDraft?.()
           }
         },
         onBlur: () => setToken(null)
@@ -7824,12 +10710,181 @@ function GroupMentionInput({ members, onChange, value, ...inputProps }) {
   })
 }
 
-function GroupChatWorkspace({ group, members, onBack }) {
+/** One member's pending prompt, rendered in the room (#90694).
+ *  - clarify: choices as tap buttons (multi-select stages; single-select
+ *    stages one), free text always available, batch sub-questions each get
+ *    their own input.
+ *  - approval: the command in a code row plus the server's choice set
+ *    (once/session/always/deny) as buttons — no free text; approvals are a
+ *    closed choice. Answer sends via the member's own source. */
+function GroupClarifyCard({ entry, members }) {
+  const { group } = entry
+  const isApproval = entry.kind === 'approval'
+  const member = members.find(m => groupMemberKey(m) === entry.memberKey) || members.find(m => m.name === entry.member)
+  const [drafts, setDrafts] = useState({})
+  const [picked, setPicked] = useState({})
+  const [sending, setSending] = useState(false)
+  const questions = entry.questions && entry.questions.length
+    ? entry.questions.map((q, i) => ({
+        qid: q?.qid ?? q?.id ?? `q${i}`,
+        question: typeof q?.question === 'string' ? q.question : '',
+        choices: Array.isArray(q?.choices) ? q.choices.filter(c => typeof c === 'string' && c) : [],
+        multiSelect: Boolean(q?.multi_select ?? q?.multiSelect)
+      }))
+    : [{ qid: '__single__', question: entry.question, choices: entry.choices, multiSelect: entry.multiSelect }]
+
+  const answerFor = q => {
+    const chosen = picked[q.qid] || []
+
+    if (chosen.length) {
+      return q.multiSelect ? JSON.stringify(chosen) : chosen[0]
+    }
+
+    return isApproval ? '' : (drafts[q.qid] || '').trim()
+  }
+
+  const allAnswered = questions.every(q => answerFor(q))
+
+  const submit = async () => {
+    if (!member || sending || !allAnswered) {
+      return
+    }
+
+    setSending(true)
+
+    try {
+      if (isApproval || !(entry.questions && entry.questions.length)) {
+        await answerGroupClarify(entry, member, answerFor(questions[0]))
+      } else {
+        const answers = {}
+
+        for (const q of questions) {
+          answers[q.qid] = answerFor(q)
+        }
+
+        await answerGroupClarify(entry, member, answers)
+      }
+
+      // Echo the exchange into the room log so the thread reads complete.
+      const summary = isApproval
+        ? `${answerFor(questions[0])} — ${entry.command || entry.question || 'command approval'}`
+        : questions
+            .map(q => (questions.length > 1 ? `${q.question}: ${answerFor(q)}` : answerFor(q)))
+            .join('\n')
+      appendGroupChatEntry(group, { kind: 'user', name: 'You' }, summary, entry.thread || 'legacy')
+    } catch (err) {
+      host.notify({ kind: 'error', message: `Could not send the answer to @${botHandle(entry.member, member)}: ${err?.message || err}` })
+    } finally {
+      setSending(false)
+    }
+  }
+
+  return jsxs('div', {
+    className:
+      'grid gap-1.5 rounded-md border border-(--ui-accent,#4f9cf9)/50 bg-(--ui-accent,#4f9cf9)/5 px-2.5 py-2',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-1.5 text-xs font-medium',
+        children: [
+          jsx(Codicon, {
+            name: isApproval ? 'shield' : 'question',
+            className: 'shrink-0 text-(--ui-accent,#4f9cf9)'
+          }),
+          isApproval
+            ? `@${botHandle(entry.member, member)} wants to run a command:`
+            : `@${botHandle(entry.member, member)} asks:`
+        ]
+      }),
+      isApproval && entry.command
+        ? jsx('code', {
+            className:
+              'block overflow-x-auto rounded bg-(--ui-bg-secondary,rgba(0,0,0,0.25)) px-2 py-1 font-mono text-[0.7rem] whitespace-pre-wrap break-all',
+            children: entry.command
+          })
+        : null,
+      ...questions.map(q =>
+        jsxs('div', {
+          className: 'grid gap-1',
+          children: [
+            q.question
+              ? jsx('div', { className: 'text-xs whitespace-pre-wrap', children: q.question })
+              : null,
+            q.choices.length
+              ? jsx('div', {
+                  className: 'flex flex-wrap gap-1',
+                  children: q.choices.map(choice => {
+                    const chosen = (picked[q.qid] || []).includes(choice)
+
+                    return jsx(Button, {
+                      size: 'sm',
+                      variant: chosen ? 'default' : 'secondary',
+                      className: cn(
+                        'h-6 px-2 text-[0.7rem]',
+                        isApproval && choice === 'deny' && !chosen && 'text-destructive'
+                      ),
+                      onClick: () => {
+                        setDrafts(prev => ({ ...prev, [q.qid]: '' }))
+                        setPicked(prev => {
+                          const current = prev[q.qid] || []
+                          const next = q.multiSelect
+                            ? chosen
+                              ? current.filter(c => c !== choice)
+                              : [...current, choice]
+                            : chosen
+                              ? []
+                              : [choice]
+
+                          return { ...prev, [q.qid]: next }
+                        })
+                      },
+                      children: choice
+                    }, `choice:${q.qid}:${choice}`)
+                  })
+                })
+              : null,
+            // Approvals are a closed choice set — no free-text input.
+            isApproval
+              ? null
+              : jsx(Input, {
+                  'aria-label': `Answer @${entry.member}`,
+                  placeholder: q.choices.length ? 'Or type your own answer…' : 'Type your answer…',
+                  value: drafts[q.qid] || '',
+                  onChange: event => {
+                    const value = event.target.value
+                    setPicked(prev => ({ ...prev, [q.qid]: [] }))
+                    setDrafts(prev => ({ ...prev, [q.qid]: value }))
+                  },
+                  onKeyDown: event => {
+                    if (event.key === 'Enter' && questions.length === 1) {
+                      event.preventDefault()
+                      void submit()
+                    }
+                  },
+                  className: 'h-7 text-xs'
+                }, `input:${q.qid}`)
+          ]
+        }, `q:${q.qid}`)
+      ),
+      jsx('div', {
+        className: 'flex justify-end',
+        children: jsx(Button, {
+          size: 'sm',
+          disabled: sending || !allAnswered || !member,
+          onClick: () => void submit(),
+          children: sending ? 'Sending…' : isApproval ? 'Respond' : 'Answer'
+        })
+      })
+    ]
+  })
+}
+
+function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
   const [draft, setDraft] = useState('')
   const [confirmDisband, setConfirmDisband] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
   // connections). Naturally every speaker just shows its display name.
@@ -7842,6 +10897,121 @@ function GroupChatWorkspace({ group, members, onBack }) {
   const [openThreads, setOpenThreads] = useState({})
   const [replyThread, setReplyThread] = useState(null)
   const [replyDrafts, setReplyDrafts] = useState({})
+  // Pending image attachments per composer: `null` thread key = the main
+  // composer, otherwise the reply box of that thread. Data URLs, already
+  // downscaled — they ride the send into every responding member's session.
+  const [pendingImages, setPendingImages] = useState({})
+
+  // Scroll anchoring (#89835): rooms used to open at scroll position 0 and
+  // stay there while replies streamed in. Scroll the bottom sentinel into
+  // view on mount and whenever the log grows — but only when the user is
+  // already near the bottom, so reading history is never yanked away.
+  const bottomSentinelRef = useRef(null)
+  const stickToBottomRef = useRef(true)
+
+  useEffect(() => {
+    const sentinel = bottomSentinelRef.current
+
+    if (!sentinel) {
+      return
+    }
+
+    const viewport = sentinel.closest('[data-slot="scroll-area-viewport"]')
+
+    if (viewport) {
+      const onScroll = () => {
+        stickToBottomRef.current = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 80
+      }
+
+      viewport.addEventListener('scroll', onScroll, { passive: true })
+
+      return () => viewport.removeEventListener('scroll', onScroll)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (stickToBottomRef.current) {
+      bottomSentinelRef.current?.scrollIntoView({ block: 'end' })
+    }
+  }, [room.log.length, room.running])
+
+  // Retained-pane reopen (#89835 follow-up): a hot-mounted room pane stays
+  // mounted while another workspace tab is active, so returning to it never
+  // remounts and the mount-time anchor doesn't rerun. Re-anchor on the
+  // hidden → visible edge — an explicit reopen, so it overrides a stale
+  // read-position and mirrors what a fresh open does.
+  const wasVisibleRef = useRef(visible)
+
+  useEffect(() => {
+    if (visible && !wasVisibleRef.current) {
+      stickToBottomRef.current = true
+      bottomSentinelRef.current?.scrollIntoView({ block: 'end' })
+    }
+
+    wasVisibleRef.current = visible
+  }, [visible])
+
+  const imagesFor = thread => pendingImages[thread ?? 'main'] || []
+
+  const addImages = (thread, picked) => {
+    if (!picked.length) {
+      return
+    }
+
+    const key = thread ?? 'main'
+    setPendingImages(prev => ({ ...prev, [key]: [...(prev[key] || []), ...picked] }))
+  }
+
+  const clearImages = thread => {
+    const key = thread ?? 'main'
+    setPendingImages(prev => ({ ...prev, [key]: [] }))
+  }
+
+  const removeImage = (thread, index) => {
+    const key = thread ?? 'main'
+    setPendingImages(prev => ({ ...prev, [key]: (prev[key] || []).filter((_, i) => i !== index) }))
+  }
+
+  // Ctrl/⌘-V a screenshot (or any file) into any composer in this room.
+  const pasteImages = (thread, event) => {
+    const files = [...(event.clipboardData?.files || [])]
+
+    if (!files.length) {
+      return
+    }
+
+    event.preventDefault()
+    void filesToGroupAttachments(files).then(picked => addImages(thread, picked))
+  }
+
+  // Drag & drop anywhere on the room drops into the ACTIVE composer — the
+  // open reply box when one owns the composer, else the main (new-thread)
+  // composer. Matches the 1:1 chat's drop affordance.
+  const [dragOver, setDragOver] = useState(false)
+
+  const dropFiles = event => {
+    const files = [...(event.dataTransfer?.files || [])]
+
+    setDragOver(false)
+
+    if (!files.length) {
+      return
+    }
+
+    event.preventDefault()
+    void filesToGroupAttachments(files).then(picked => addImages(replyThread, picked))
+  }
+
+  // Collapsible Activity view: collapsed by default — opening it is always an
+  // explicit user action, it never steals focus, and it never auto-scrolls.
+  const [activityOpen, setActivityOpen] = useState(false)
+  // Subscribe: activity rows re-render as turn events land.
+  useValue($groupActivity)
+  // Pending member questions for THIS room (#90694), oldest first.
+  const clarifyAll = useValue($groupClarify)
+  const roomClarifies = Object.values(clarifyAll || {})
+    .filter(entry => entry?.group === group)
+    .sort((a, b) => (a.at || 0) - (b.at || 0))
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -7852,6 +11022,14 @@ function GroupChatWorkspace({ group, members, onBack }) {
         onClick: () => (onBack ? onBack() : $groupChatWorkspace.set(null)),
         children: 'Back'
       }),
+      // Room picture (set via Group settings) leads the title when present.
+      room.image
+        ? jsx('img', {
+            src: room.image,
+            alt: '',
+            className: 'size-6 shrink-0 rounded-full object-cover ring-1 ring-(--ui-stroke-secondary)'
+          })
+        : null,
       jsx('div', {
         className: 'min-w-0 flex-1 truncate text-sm font-semibold',
         children: `${group} — group chat`
@@ -7879,6 +11057,14 @@ function GroupChatWorkspace({ group, members, onBack }) {
       jsx(Button, {
         variant: 'ghost',
         size: 'sm',
+        className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
+        title: `Group settings — rename ${group} or set a room picture`,
+        onClick: () => setSettingsOpen(true),
+        children: jsx(Codicon, { name: 'gear' })
+      }),
+      jsx(Button, {
+        variant: 'ghost',
+        size: 'sm',
         className: 'shrink-0 text-(--ui-text-tertiary) hover:text-destructive',
         title: `Disband the ${group} group chat`,
         onClick: () => setConfirmDisband(true),
@@ -7893,18 +11079,85 @@ function GroupChatWorkspace({ group, members, onBack }) {
       title: (b.remoteSource ? '' : allMeta[b.name]?.title) || b.title || ''
     }))
 
+  // Activity disclosure: quiet, collapsed by default. The collapsed row shows
+  // the latest event; expanding lists the current run's events newest-first.
+  // Events are epoch-tagged, so a superseded run's history drops out of view.
+  const activityEvents = currentGroupActivity(group)
+  const latestActivity = activityEvents.length ? activityEvents[activityEvents.length - 1] : null
+  const activityPanel = jsxs('div', {
+    className: 'border-b border-(--ui-stroke-secondary)',
+    children: [
+      jsxs('button', {
+        type: 'button',
+        'aria-expanded': activityOpen,
+        'aria-controls': `group-activity:${group}`,
+        title: activityOpen ? 'Hide room activity' : 'Show room activity',
+        className:
+          'flex w-full items-center gap-1.5 px-2.5 py-1 text-left text-[0.7rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
+        onClick: () => setActivityOpen(prev => !prev),
+        children: [
+          jsx(Codicon, {
+            name: activityOpen ? 'chevron-down' : 'chevron-right',
+            className: 'shrink-0 text-[0.65rem]'
+          }),
+          jsx('span', { className: 'shrink-0 font-medium', children: 'Activity' }),
+          latestActivity
+            ? jsx('span', {
+                className: 'min-w-0 flex-1 truncate',
+                children: `${groupActivityLabel(latestActivity)} · ${relativeTime(latestActivity.at)}`
+              })
+            : null
+        ]
+      }),
+      activityOpen
+        ? jsx('div', {
+            id: `group-activity:${group}`,
+            className: 'grid gap-0.5 px-2.5 pb-1.5',
+            children: activityEvents.length
+              ? [...activityEvents]
+                  .reverse()
+                  .map((event, i) =>
+                    jsxs('div', {
+                      className: 'flex items-center gap-1.5 text-[0.7rem]',
+                      children: [
+                        jsx(Codicon, {
+                          name: GROUP_ACTIVITY_GLYPHS[event.kind] || 'circle-outline',
+                          className: cn('shrink-0 text-[0.65rem]', groupActivityTone(event.kind))
+                        }),
+                        jsx('span', {
+                          className: cn('min-w-0 flex-1 truncate', groupActivityTone(event.kind)),
+                          children: groupActivityLabel(event)
+                        }),
+                        jsx('span', {
+                          className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                          children: relativeTime(event.at)
+                        })
+                      ]
+                    }, `${event.at}:${i}`)
+                  )
+              : jsx('div', {
+                  className: 'px-0.5 pb-0.5 text-[0.625rem] text-(--ui-text-quaternary)',
+                  children: 'No activity in this turn yet.'
+                })
+          })
+        : null
+    ]
+  })
+
   const submit = () => {
     const text = draft.trim()
+    const images = imagesFor(null)
 
-    if (!text) {
+    if (!text && !images.length) {
       return
     }
 
     setDraft('')
+    clearImages(null)
     // Main composer = START A NEW THREAD with the whole group (Slack shape).
     // Full descriptors ride into the turn loop: remote members keep their
     // connection fields so their turns route to their own machines.
-    const minted = sendToGroupChat(group, memberDescriptors(), text)
+    const minted = sendToGroupChat(group, memberDescriptors(), text, null, images)
 
     if (minted) {
       setOpenThreads(prev => ({ ...prev, [minted]: true }))
@@ -7913,17 +11166,70 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
   const submitReply = thread => {
     const text = (replyDrafts[thread] || '').trim()
+    const images = imagesFor(thread)
 
-    if (!text) {
+    if (!text && !images.length) {
       return
     }
 
     setReplyDrafts(prev => ({ ...prev, [thread]: '' }))
+    clearImages(thread)
     // Reply box = CONTINUE this thread; the member turns it triggers are
     // scoped to it.
-    sendToGroupChat(group, memberDescriptors(), text, thread)
+    sendToGroupChat(group, memberDescriptors(), text, thread, images)
     setOpenThreads(prev => ({ ...prev, [thread]: true }))
   }
+
+  /** Pending-attachment chips + the picker for one composer (thread = null →
+   *  main). Image chips preview the pixels; PDFs/files show a type icon.
+   *  X removes it. */
+  const attachmentRow = thread => {
+    const images = imagesFor(thread)
+
+    if (!images.length) {
+      return null
+    }
+
+    return jsx('div', {
+      className: 'flex flex-wrap items-center gap-1.5 px-1 pb-1',
+      children: images.map((img, index) =>
+        jsxs('div', {
+          className:
+            'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary,#181818) px-1 py-0.5',
+          children: [
+            img.kind === 'pdf' || img.kind === 'file'
+              ? jsx(Codicon, {
+                  name: img.kind === 'pdf' ? 'file-pdf' : 'file',
+                  className: 'text-[0.9rem] text-(--ui-text-tertiary)'
+                })
+              : jsx('img', { src: img.data, alt: '', className: 'size-6 rounded object-cover' }),
+            jsx('span', {
+              className: 'max-w-32 truncate text-[0.65rem] text-(--ui-text-tertiary)',
+              children: img.name || 'image'
+            }),
+            jsx('button', {
+              type: 'button',
+              className: 'cursor-pointer border-0 bg-transparent p-0 text-(--ui-text-quaternary) hover:text-foreground',
+              title: 'Remove attachment',
+              onClick: () => removeImage(thread, index),
+              children: jsx(Codicon, { name: 'close', className: 'text-[0.65rem]' })
+            })
+          ]
+        }, `${img.name || 'img'}:${index}`)
+      )
+    })
+  }
+
+  const attachButton = thread =>
+    jsx(Button, {
+      type: 'button',
+      variant: 'ghost',
+      size: 'sm',
+      className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
+      title: 'Attach files — every responding bot sees them',
+      onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
+      children: jsx(Codicon, { name: 'attach' })
+    })
 
   // One log entry, rendered exactly as before conversation folding existed.
   const renderEntry = (entry, index) => {
@@ -7962,7 +11268,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
                   return jsxs('div', {
                     className: cn(
-                      'flex items-start gap-2',
+                      'group flex items-start gap-2',
                       isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1'
                     ),
                     children: [
@@ -7982,7 +11288,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                         className: 'min-w-0 flex-1',
                         children: [
                           jsxs('div', {
-                            className: 'flex items-baseline gap-2',
+                            className: 'flex items-center gap-2',
                             children: [
                               isUser
                                 ? jsx('span', {
@@ -8000,14 +11306,56 @@ function GroupChatWorkspace({ group, members, onBack }) {
                               jsx('span', {
                                 className: 'text-[0.625rem] text-(--ui-text-quaternary)',
                                 children: relativeTime(entry.at)
-                              })
+                              }),
+                              entry.text.trim()
+                                ? jsx('div', {
+                                    className:
+                                      'ml-auto shrink-0 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100',
+                                    children: jsx(CopyButton, {
+                                      appearance: 'icon',
+                                      buttonSize: 'icon',
+                                      stopPropagation: true,
+                                      text: entry.text
+                                    })
+                                  })
+                                : null
                             ]
                           }),
                           jsx('div', {
                             className:
                               'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0 [&_ul]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_pre]:overflow-x-auto',
+                            // The app shell sets user-select: none globally; message bodies opt
+                            // back in so drag-select and ⌘C work in group chat logs.
+                            'data-selectable-text': 'true',
                             children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
-                          })
+                          }),
+                          // User attachments: what every responding bot was
+                          // shown — image previews, or a named chip for
+                          // PDFs/files.
+                          Array.isArray(entry.images) && entry.images.length
+                            ? jsx('div', {
+                                className: 'mt-1 flex flex-wrap items-center gap-1.5',
+                                children: entry.images.map((img, imgIndex) =>
+                                  img.kind === 'pdf' || img.kind === 'file'
+                                    ? jsxs('div', {
+                                        className:
+                                          'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-1.5 py-1 text-[0.65rem] text-(--ui-text-tertiary)',
+                                        title: img.name || 'attached file',
+                                        children: [
+                                          jsx(Codicon, { name: img.kind === 'pdf' ? 'file-pdf' : 'file', className: 'text-[0.8rem]' }),
+                                          jsx('span', { className: 'max-w-48 truncate', children: img.name || 'attached file' })
+                                        ]
+                                      }, `${entryKey}:img:${imgIndex}`)
+                                    : jsx('img', {
+                                        src: img.data,
+                                        alt: img.name || 'attached image',
+                                        title: img.name || 'attached image',
+                                        className:
+                                          'max-h-40 max-w-60 rounded-md border border-(--ui-stroke-secondary) object-contain'
+                                      }, `${entryKey}:img:${imgIndex}`)
+                                )
+                              })
+                            : null
                         ]
                       })
                     ]
@@ -8098,21 +11446,35 @@ function GroupChatWorkspace({ group, members, onBack }) {
     threadRows.push(
       replyThread === id
         ? jsxs('form', {
-            className: 'flex items-center gap-1.5 px-2 pb-1',
+            className: 'grid gap-0 px-2 pb-1',
             onSubmit: event => {
               event.preventDefault()
               submitReply(id)
             },
             children: [
-              jsx(GroupMentionInput, {
-                'aria-label': 'Reply in thread',
-                autoFocus: true,
-                placeholder: 'Reply in thread…',
-                members,
-                value: replyDrafts[id] || '',
-                onChange: text => setReplyDrafts(prev => ({ ...prev, [id]: text }))
-              }),
-              jsx(Button, { type: 'submit', size: 'sm', disabled: !(replyDrafts[id] || '').trim(), children: 'Reply' })
+              attachmentRow(id),
+              jsxs('div', {
+                className: 'flex items-center gap-1.5',
+                children: [
+                  jsx(GroupMentionInput, {
+                    'aria-label': 'Reply in thread',
+                    autoFocus: true,
+                    placeholder: 'Reply in thread…',
+                    members,
+                    value: replyDrafts[id] || '',
+                    onChange: text => setReplyDrafts(prev => ({ ...prev, [id]: text })),
+                    onSubmitDraft: () => submitReply(id),
+                    onPaste: event => pasteImages(id, event)
+                  }),
+                  attachButton(id),
+                  jsx(Button, {
+                    type: 'submit',
+                    size: 'sm',
+                    disabled: !(replyDrafts[id] || '').trim() && !imagesFor(id).length,
+                    children: 'Reply'
+                  })
+                ]
+              })
             ]
           }, `replybox:${id}`)
         : jsx('button', {
@@ -8133,9 +11495,31 @@ function GroupChatWorkspace({ group, members, onBack }) {
   })
 
   return jsxs('div', {
-    className: 'flex h-full flex-col',
+    className: 'relative flex h-full flex-col',
+    onDragOver: event => {
+      if ([...(event.dataTransfer?.types || [])].includes('Files')) {
+        event.preventDefault()
+        setDragOver(true)
+      }
+    },
+    onDragLeave: event => {
+      // Only clear when leaving the room container itself, not when the
+      // cursor moves between its children.
+      if (!event.currentTarget.contains(event.relatedTarget)) {
+        setDragOver(false)
+      }
+    },
+    onDrop: dropFiles,
     children: [
+      dragOver
+        ? jsx('div', {
+            className:
+              'pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-(--ui-accent,#4f9cf9) text-sm font-medium text-(--ui-accent,#4f9cf9)',
+            children: replyThread ? 'Drop to attach to this thread reply' : 'Drop to attach — every responding bot sees it'
+          }, 'dropzone')
+        : null,
       header,
+      activityPanel,
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
         children: jsxs('div', {
@@ -8149,36 +11533,65 @@ function GroupChatWorkspace({ group, members, onBack }) {
                     children: 'Say something — every bot in this group hears the room.'
                   }, 'empty')
                 ]),
+            ...roomClarifies.map(entry =>
+              jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
+            ),
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: room.turn
-                    ? `${groupSpeakerLabel(room.turn)} is thinking…`
-                    : 'The room is working…'
+                  children: roomClarifies.length
+                    ? 'Waiting for your answer…'
+                    : room.turn
+                      ? `${groupSpeakerLabel(room.turn)} is thinking…`
+                      : 'The room is working…'
                 }, 'working')
-              : null
+              : null,
+            // Scroll anchor (#89835): rooms opened at scroll position 0, mid-
+            // history. The effect below scrolls this sentinel into view on
+            // mount and on log growth — unless the user has scrolled up.
+            jsx('div', { ref: bottomSentinelRef, 'aria-hidden': true }, 'bottom-sentinel')
           ]
         })
       }),
       jsx('div', {
         className: 'border-t border-(--ui-stroke-secondary) p-2',
         children: jsxs('form', {
-          className: 'flex items-center gap-1.5',
+          className: 'grid gap-0',
           onSubmit: event => {
             event.preventDefault()
             submit()
           },
           children: [
-            jsx(GroupMentionInput, {
-              'aria-label': `Message ${group}`,
-              placeholder: `New thread in ${group}… (@name to direct, @everyone for all)`,
-              members,
-              value: draft,
-              onChange: setDraft
-            }),
-            jsx(Button, { type: 'submit', size: 'sm', disabled: !draft.trim(), children: 'New Thread' })
+            attachmentRow(null),
+            jsxs('div', {
+              className: 'flex items-center gap-1.5',
+              children: [
+                jsx(GroupMentionInput, {
+                  'aria-label': `Message ${group}`,
+                  placeholder: `New thread in ${group}… (@name to direct, @everyone for all)`,
+                  members,
+                  value: draft,
+                  onChange: setDraft,
+                  onSubmitDraft: submit,
+                  onPaste: event => pasteImages(null, event)
+                }),
+                attachButton(null),
+                jsx(Button, {
+                  type: 'submit',
+                  size: 'sm',
+                  disabled: !draft.trim() && !imagesFor(null).length,
+                  children: 'New Thread'
+                })
+              ]
+            })
           ]
         })
+      }),
+      jsx(GroupChatSettingsDialog, {
+        group,
+        members,
+        open: settingsOpen,
+        onClose: () => setSettingsOpen(false)
       }),
       jsx(ConfirmDialog, {
         open: confirmDisband,
@@ -8189,9 +11602,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
             jsx('span', { className: 'font-medium text-foreground', children: group }),
             ' grouping from its ',
             String(members.length),
-            ' bots and clears the shared room log. The bots themselves and their “Group: ',
-            group,
-            '” sessions are kept — you can still open those from each bot’s session browser.'
+            // New rooms title member sessions by roomId, legacy rooms by name —
+            // so the copy names the concept, not a literal session title.
+            ' bots and clears the shared room log. The bots themselves and their per-group sessions are kept.'
           ]
         }),
         destructive: true,
@@ -8212,10 +11625,44 @@ function GroupChatWorkspace({ group, members, onBack }) {
  *  disband (or the room view's own Back) can retire the tab it opened. */
 const groupChatMainTabs = new Map()
 
+/** Reactive shadow of `groupChatMainTabs` membership. The Map itself can't
+ *  notify React, and #89788's first fix read it non-reactively: a BotsPane
+ *  render that landed between selecting the group and recording its main
+ *  tab kept the in-pane room on screen forever (the map write repaints
+ *  nothing). Every map mutation goes through the two helpers below so the
+ *  rev bump re-evaluates the gate. */
+const $groupMainTabsRev = atom(0)
+
+function recordGroupMainTab(group, close) {
+  groupChatMainTabs.set(group, close)
+  $groupMainTabsRev.set($groupMainTabsRev.get() + 1)
+}
+
+function dropGroupMainTab(group) {
+  if (groupChatMainTabs.delete(group)) {
+    $groupMainTabsRev.set($groupMainTabsRev.get() + 1)
+  }
+}
+
+/** The in-panel room is the FALLBACK surface, not a second copy: it renders
+ *  only while no main-window tab owns the group. On desktops with the door
+ *  the room already lives in a main tab, and painting it here too produced
+ *  two live panes with independent drafts driving one shared engine (#89788).
+ *  The selection atom stays set either way so the roster row still
+ *  highlights. Callers must subscribe to `$groupMainTabsRev` (BotsPane does)
+ *  so ownership changes re-run this gate. */
+function shouldRenderGroupChatInPane(group) {
+  return Boolean(group && !groupChatMainTabs.has(group))
+}
+
 function closeGroupChatMainTab(group) {
   const close = groupChatMainTabs.get(group)
 
-  groupChatMainTabs.delete(group)
+  dropGroupMainTab(group)
+
+  if ($groupChatWorkspace.get() === group) {
+    $groupChatWorkspace.set(null)
+  }
 
   if (typeof close === 'function') {
     try {
@@ -8228,20 +11675,37 @@ function closeGroupChatMainTab(group) {
 
 /** Main-window wrapper: seats the member roster reactively (live roster +
  *  bot meta + the room's stored cross-connection descriptors) so the room
- *  keeps working as members change while the tab is open. */
+ *  keeps working as members change while the tab is open. Also subscribes to
+ *  this pane's visibility (feature-detected host.paneVisibility): retained
+ *  panes stay mounted while hidden, so the workspace needs the hidden →
+ *  visible edge to re-anchor its log to the bottom (#89835 follow-up). */
 function GroupChatMainView({ group }) {
   const allMeta = useValue($botMeta)
   // Subscribe: membership changes ride bot meta AND the room record.
   useValue($groupChats)
   const roster = useValue($lastRoster)
   const members = groupChatMemberBots(group, roster, allMeta)
+  // Older SDKs have no paneVisibility: fall back to an always-visible atom so
+  // the hook order stays stable and behavior matches the previous build.
+  const $visible = useMemo(
+    () => (typeof host.paneVisibility === 'function' ? host.paneVisibility(`plugin-workspace:${ID}:group:${slugify(group)}`) : atom(true)),
+    [group]
+  )
+  const visible = useValue($visible)
 
-  return jsx(GroupChatWorkspace, { group, members, onBack: () => closeGroupChatMainTab(group) })
+  return jsx(GroupChatWorkspace, { group, members, visible, onBack: () => closeGroupChatMainTab(group) })
 }
 
 /** Open a group chat the Discord way: a tab taking over the MAIN chat window
  *  (host.openWorkspace, newer desktops), falling back to the in-panel room
- *  view on desktops whose SDK predates the main-area door. */
+ *  view on desktops whose SDK predates the main-area door.
+ *
+ *  Ordering matters (#89788 follow-up): the main tab must be RECORDED before
+ *  the selection atom is set. Setting the atom first opened a window where
+ *  BotsPane rendered with a selected group and an empty tab map — the
+ *  in-pane fallback painted alongside the main tab, and because the map
+ *  write itself repaints nothing, the duplicate stuck until an unrelated
+ *  re-render. */
 function openGroupChat(group) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
 
@@ -8251,10 +11715,19 @@ function openGroupChat(group) {
         title: group,
         minWidth: '24rem',
         render: () => jsx(GroupChatMainView, { group }),
-        onClose: () => groupChatMainTabs.delete(group)
+        onClose: () => {
+          dropGroupMainTab(group)
+
+          if ($groupChatWorkspace.get() === group) {
+            $groupChatWorkspace.set(null)
+          }
+        }
       })
 
-      groupChatMainTabs.set(group, close)
+      recordGroupMainTab(group, close)
+      // Tab ownership is on record — the atom now only drives the roster
+      // highlight; shouldRenderGroupChatInPane stays false throughout.
+      $groupChatWorkspace.set(group)
 
       return
     } catch {
@@ -8262,6 +11735,8 @@ function openGroupChat(group) {
     }
   }
 
+  // No main-window door (older desktop) or it threw: select the group so
+  // the in-panel room renders as the fallback surface.
   $groupChatWorkspace.set(group)
 }
 
@@ -8270,19 +11745,23 @@ function openGroupChat(group) {
  *  (markdown flattened), relative time of the last activity, and the
  *  needs-you badge on the row itself. Sorts into the same recency ordering
  *  as bot rows; clicking opens the room in the main chat window. */
-function GroupRow({ group, members, needsYou, onOpen }) {
+function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [] }
   const log = Array.isArray(room.log) ? room.log : []
   const last = log.length ? log[log.length - 1] : null
   const lastAt = groupLastActivity(room)
+  // Room previews speak the same handle vocabulary as the roster, mentions
+  // and the group prompt: the primary profile is @hermes, not @default.
+  const lastFrom = last?.from?.name || ''
+  const lastHandle = botHandle(lastFrom || 'bot', members.find(member => member?.name === lastFrom))
   const preview = last
-    ? `${last.from?.kind === 'user' ? 'You' : `@${last.from?.name || 'bot'}`}: ${stripPreviewMarkdown(last.text) || '…'}`
+    ? `${last.from?.kind === 'user' ? 'You' : `@${lastHandle}`}: ${stripPreviewMarkdown(last.text) || '…'}`
     : 'No messages yet — say hi to the room'
   const faces = members.slice(0, 3)
 
-  return jsxs('button', {
+  const row = jsxs('button', {
     type: 'button',
     onClick: () => {
       haptic('tap')
@@ -8290,14 +11769,22 @@ function GroupRow({ group, members, needsYou, onOpen }) {
     },
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
-      'hover:bg-(--chrome-action-hover)'
+      'hover:bg-(--chrome-action-hover)',
+      active && 'bg-(--ui-row-active-background)'
     ),
     children: [
-      // Composite avatar: up to three member faces fanned like Discord's
-      // group-DM icon; a bare glyph when the room has no seated members.
+      // Room picture when the user set one; else a composite avatar of up to
+      // three member faces fanned like Discord's group-DM icon; a bare glyph
+      // when the room has no seated members.
       jsx('div', {
         className: 'flex w-[34px] shrink-0 items-center justify-center',
-        children: faces.length
+        children: room.image
+          ? jsx('img', {
+              src: room.image,
+              alt: '',
+              className: 'size-7 rounded-full object-cover ring-2 ring-(--ui-bg-primary,#111)'
+            })
+          : faces.length
           ? jsx('div', {
               className: 'flex items-center -space-x-2.5',
               children: faces.map(member => {
@@ -8363,6 +11850,26 @@ function GroupRow({ group, members, needsYou, onOpen }) {
       })
     ]
   })
+
+  return jsxs(ContextMenu, {
+    children: [
+      jsx(ContextMenuTrigger, { asChild: true, children: row }),
+      jsxs(ContextMenuContent, {
+        children: [
+          jsx(ContextMenuItem, {
+            onSelect: () => onOpen(group),
+            children: 'Open Group Chat'
+          }),
+          jsx(ContextMenuSeparator, {}),
+          jsx(ContextMenuItem, {
+            className: 'text-destructive focus:text-destructive',
+            onSelect: () => onDisband({ name: group, members }),
+            children: 'Delete Group'
+          })
+        ]
+      })
+    ]
+  })
 }
 
 function BotsPane() {
@@ -8374,11 +11881,16 @@ function BotsPane() {
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
+  const [deletingGroup, setDeletingGroup] = useState(null)
   const [grouping, setGrouping] = useState(null)
   const [query, setQuery] = useState('')
   const activityToasts = useValue($activityToasts)
-  const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
+  // Main-tab ownership is a module Map; this rev subscription makes the
+  // shouldRenderGroupChatInPane gate below reactive to tab open/close
+  // (#89788 follow-up — without it a stale render could paint the in-pane
+  // room beside a live main tab and stick).
+  useValue($groupMainTabsRev)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
 
@@ -8396,7 +11908,7 @@ function BotsPane() {
   // No special slot for the primary bot — it competes on recency too.
   const activityOf = bot => {
     const created = botRosterMeta(bot, allMeta)?.created || bot.ui_meta?.['hermes-bots']?.created || 0
-    const lastMsg = (bot.last_session?.last_active || 0) * 1000
+    const lastMsg = (botActivitySession(bot)?.last_active || 0) * 1000
 
     return Math.max(created, lastMsg)
   }
@@ -8428,7 +11940,7 @@ function BotsPane() {
   const showHidden = useValue($showHiddenBots)
   const unreadByName = useValue($botUnread)
   const hiddenBots = roster.filter(bot => isBotHidden(bot, allMeta))
-  const hiddenUnread = hiddenBots.some(bot => !bot.remoteSource && unreadByName[bot.name])
+  const hiddenUnread = hiddenBots.some(bot => unreadByName[botSelectionKey(bot)])
   const visibleRoster = showHidden ? roster : roster.filter(bot => !isBotHidden(bot, allMeta))
   const filteredRoster = filterBots(visibleRoster, allMeta, query)
   // Group chats are first-class roster rows (Discord-style): one standalone
@@ -8460,7 +11972,7 @@ function BotsPane() {
 
   if (live) {
     $lastRoster.set(roster)
-    mergeServerMeta(activeSourceRoster)
+    mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
     pullServerAvatars(activeSourceRoster)
     trackInboundActivity(activeSourceRoster)
     backfillMessagingProtocol(activeSourceRoster)
@@ -8469,15 +11981,9 @@ function BotsPane() {
   const staleNotice = error && !live && roster.length
     ? 'Roster refresh failed — showing the last good list.' + (gatewayUp ? '' : ' Waiting for the gateway to reconnect…')
     : null
-  const sessionsWorkspaceBot = roster.find(bot => bot.name === sessionsWorkspaceName)
-
-  if (sessionsWorkspaceBot) {
-    return jsx(ProfileSessionsWorkspace, { bot: sessionsWorkspaceBot })
-  }
-
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
-  if (groupChatName && groupChatMembers.length) {
+  if (shouldRenderGroupChatInPane(groupChatName) && groupChatMembers.length) {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
   }
 
@@ -8574,48 +12080,49 @@ function BotsPane() {
         gatewayState,
         metaByName: allMeta,
         onOpen: bot => {
+          const generation = ++botOpenGeneration
           haptic('tap')
-          $selectedBot.set(bot.name)
+          $selectedBot.set(botSelectionKey(bot))
 
-          if (bot.remoteSource) {
-            const handle = botHandle(bot.name, bot)
-            host.notify?.({
-              kind: 'info',
-              title: displayName(bot),
-              message: `Stay in this chat and @${handle} to message them. Gateway stays on this device.`
-            })
-            return
-          }
-
-          if ($botUnread.get()[bot.name]) {
+          if ($botUnread.get()[botSelectionKey(bot)]) {
             const next = { ...$botUnread.get() }
-            delete next[bot.name]
+            delete next[botSelectionKey(bot)]
             $botUnread.set(next)
           }
 
           void (async () => {
-            let pinnedChat = botRosterMeta(bot, allMeta)?.chat
-
             try {
-              pinnedChat = await prepareBotSource(bot, pinnedChat)
+              await prepareBotSource(bot)
             } catch (error) {
               host.notifyError?.(error, `Could not reach ${bot.connectionLabel || 'the remote source'}`)
 
               return
             }
 
-            try {
-              const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
+            if (generation !== botOpenGeneration) {
+              return
+            }
 
-              if (id) {
+            try {
+              const id = await openBotCanonicalChat(bot)
+
+              if (generation === botOpenGeneration && id) {
                 return
               }
-            } catch {
-              // Fall through to the older-gateway draft below.
+            } catch (error) {
+              if (generation === botOpenGeneration) {
+                host.notifyError?.(error, `Could not open ${displayName(bot)}'s chat — try again`)
+              }
+
+              return
+            }
+
+            if (generation !== botOpenGeneration) {
+              return
             }
 
             if (typeof host.newChat === 'function') {
-              host.newChat(bot.name)
+              newBotChat(bot)
             } else {
               host.navigate('/')
             }
@@ -8691,10 +12198,12 @@ function BotsPane() {
                         ? jsx(
                             GroupRow,
                             {
+                              active: groupChatName === row.name,
                               group: row.name,
                               members: row.members,
                               needsYou: Boolean(groupNeedsYou[row.name]),
-                              onOpen: openGroupChat
+                              onOpen: openGroupChat,
+                              onDisband: setDeletingGroup
                             },
                             `group:${row.name}`
                           )
@@ -8769,6 +12278,23 @@ function BotsPane() {
           await refetch()
           host.notify({ kind: 'success', message: `Deleted profile ${name}` })
         }
+      }),
+      jsx(ConfirmDialog, {
+        open: Boolean(deletingGroup),
+        title: 'Delete group chat?',
+        description: deletingGroup
+          ? `This removes “${deletingGroup.name}” from its bots and clears the shared room log. The bots and their individual chats are kept.`
+          : null,
+        destructive: true,
+        confirmLabel: 'Delete Group',
+        busyLabel: 'Deleting…',
+        doneLabel: 'Deleted',
+        onClose: () => setDeletingGroup(null),
+        onConfirm: async () => {
+          if (!deletingGroup) return
+          await disbandGroupChat(deletingGroup.name, deletingGroup.members)
+          host.notify({ kind: 'success', message: `Deleted group “${deletingGroup.name}”` })
+        }
       })
     ]
   })
@@ -8782,11 +12308,16 @@ export default {
   description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
   register(ctx) {
     pluginCtx = ctx
+    groupChatSyncDisposed = false
     startFaceClock()
+    // The cross-connection relay rides every gateway socket this Desktop
+    // holds: roster sync + envelope drain/deliver/reply loops.
+    startBotRelay()
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(stopFaceClock)
+      ctx.onDispose(stopBotRelay)
     }
 
     // @-mention autocomplete: typing "@rese…" in ANY composer offers the
@@ -8800,14 +12331,14 @@ export default {
       area: COMPOSER_AREAS.atCompletions,
       data: {
         provide: query => {
-          const roster = queryClient.getQueryData(ROSTER_KEY)
+          const roster = cachedUnionRoster()
           const profiles = Array.isArray(roster?.profiles) ? roster.profiles : []
 
           if (!profiles.length) {
             return []
           }
 
-          const active = (host.state.profile.get() || 'default').trim() || 'default'
+          const active = focusedMentionProfile()
           const q = (query || '').toLowerCase()
           const items = []
           const live = {
@@ -8821,17 +12352,25 @@ export default {
             }
 
             const handle = botHandle(profile.name, profile)
+            const display = displayName(profile, $botMeta.get()[profile.name])
+            // Renamed bots complete on their friendly name — the tag is the
+            // renamed slug when one exists, the profile handle otherwise.
+            const tag = botMentionTag(profile)
 
-            if (q && !handle.toLowerCase().startsWith(q)) {
+            if (
+              q &&
+              !tag.toLowerCase().startsWith(q) &&
+              !handle.toLowerCase().startsWith(q) &&
+              !display.toLowerCase().startsWith(q)
+            ) {
               continue
             }
 
-            const display = displayName(profile, $botMeta.get()[profile.name])
             const source = profile.connectionLabel ? ` · ${profile.connectionLabel}` : ''
 
             items.push({
-              insert: `@${handle}`,
-              display: `@${handle}`,
+              insert: `@${tag}`,
+              display: `@${tag}`,
               meta: `Bot · ${display}${source}`
             })
           }
@@ -8850,25 +12389,10 @@ export default {
       document.head.appendChild(style)
     }
 
-    // Hydrate persisted avatars/titles. Storage may be sync, async, or
-    // absent depending on shell version — normalize through Promise.resolve
-    // inside a try so a storage quirk can NEVER fail the plugin load.
-    try {
-      Promise.resolve(ctx.storage?.get?.('bot-meta'))
-        .then(value => {
-          if (value && typeof value === 'object' && !Array.isArray(value)) {
-            const live = $botMeta.get()
-            const next = { ...value }
-            for (const name of Object.keys(live)) {
-              next[name] = { ...(value[name] || {}), ...live[name] }
-            }
-            $botMeta.set(next)
-          }
-        })
-        .catch(() => undefined)
-    } catch {
-      /* no storage on this shell — defaults stay */
-    }
+    // Hydrate persisted avatars/titles. Migration writes v2 only after a
+    // provable sole-local topology and deliberately leaves v1 untouched for
+    // one-version rollback.
+    void migrateBotMeta(ctx.storage).catch(() => undefined)
 
     // Bot Mode sessions are always hidden now — the old "hide Bot Chats"
     // pref is gone (its stored key is simply ignored). The reconciliation
@@ -8891,7 +12415,7 @@ export default {
     // and always reset — a loop can't survive a window reload anyway).
     try {
       Promise.resolve(ctx.storage?.get?.('group-chats'))
-        .then(value => {
+        .then(async value => {
           if (value && typeof value === 'object' && !Array.isArray(value)) {
             const rooms = {}
 
@@ -8903,8 +12427,12 @@ export default {
                   log: assignLegacyThreads(room.log),
                   watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
+                  sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   members: Array.isArray(room.members) ? room.members : [],
+                  roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+                  image: typeof room.image === 'string' && room.image ? room.image : null,
+                  syncRevision: Math.max(0, Number(room.syncRevision || 0)),
                   epoch: 0,
                   running: false
                 }
@@ -8913,25 +12441,32 @@ export default {
 
             $groupChats.set({ ...rooms, ...$groupChats.get() })
           }
+
+          // Receive before publish. A fresh Desktop with no local room cache
+          // must hydrate the gateway projection instead of merely avoiding an
+          // empty overwrite and then rendering an empty conversation.
+          await pullGroupChatServerState().catch(() => false)
+          scheduleGroupChatServerSync($groupChats.get())
         })
         .catch(() => undefined)
     } catch {
       /* no storage — rooms start empty */
     }
 
-    // Routines follow the chat you're in: track the live gateway profile.
+    // Routines follow the chat you're in: track the focused chat's owner
+    // profile (falls back to the live gateway profile on older desktops —
+    // see $focusedBotProfile). Keying this off the socket's home alone left
+    // the unread-suppression and Routines scope on the wrong bot whenever a
+    // focused tab showed another profile's chat.
     // Capture the unbinds: without them a disable → re-enable cycle stacks a
     // duplicate listener per cycle (same survives-disable class as the face
     // clock before its onDispose hook — these kept firing until app restart).
-    const unbindProfileListener = host.state.profile.listen(profile => {
-      if (profile && typeof profile === 'string') {
-        $selectedBot.set(profile)
-      }
-    })
+    const unbindProfileListener = bindProfileSync($focusedBotOwner)
     const unbindGatewayListener = host.state.gateway.listen(handleSessionsGatewayTransition)
 
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
+        stopGroupChatServerSync()
         if (typeof unbindProfileListener === 'function') {
           unbindProfileListener()
         }
@@ -8981,7 +12516,12 @@ export default {
       // An intra-session drag still sticks until the next launch (the
       // invariant runs at adoption time only — see enforceDockedPanes in the
       // tree store).
-      data: { placement: 'left', width: '260px', dock: { pane: 'sessions', pos: 'center', enforce: true } },
+      // collapsible: the pane lives in the sessions zone, so it must LEAVE
+      // the grid with that zone below the sidebar-collapse breakpoint. The
+      // sessions pane collapses alone without this flag. The zone then keeps
+      // a stranded BOTS tab on screen. The narrow edge overlay mirrors the
+      // zone's tab strip, so the pane stays reachable while collapsed.
+      data: { placement: 'left', width: '260px', collapsible: true, hideOnly: true, dock: { pane: 'sessions', pos: 'center', enforce: true } },
       render: () => jsx(BotsPane, {})
     })
 
@@ -9004,7 +12544,8 @@ export default {
         title: 'Cronjobs',
         data: {
           placement: 'main',
-          dock: { pane: 'workspace', pos: 'right' },
+          // Repair persisted layouts that stranded Cronjobs in the Bots tab strip.
+          dock: { pane: 'workspace', pos: 'right', enforce: true },
           width: '250px'
         },
         render: () => jsx(RoutinesPane, {})
@@ -9049,10 +12590,13 @@ export default {
       }
     })
 
-    // @-mention middleware: "@<bot> do the thing" in any chat becomes an
-    // explicit handoff instruction the active agent's SOUL.md knows how to
-    // execute. Names are validated against the LIVE roster so
-    // "user@example.com" or an unknown @ passes through untouched.
+    // @-mention middleware: "@<bot> do the thing" in any chat gets an
+    // IDENTIFICATION note — who the user is referring to, resolved against
+    // the LIVE roster ("user@example.com" or an unknown @ passes through
+    // untouched). The middleware never delivers anything itself: the agent
+    // owns messaging via its message_agent tool (Bot Chats), so there is
+    // exactly one send path and user text is never forwarded verbatim by
+    // the renderer. The composer's @-autocomplete remains the picking aid.
     ctx.register({
       id: 'mention-middleware',
       area: COMPOSER_AREAS.middleware,
@@ -9070,11 +12614,17 @@ export default {
 
           if (slashNew) {
             const activeBot = $selectedBot.get()
-            const meta = activeBot ? $botMeta.get()[activeBot] : null
-            const pinnedId = meta?.chat || null
+            // Canonical identity is the profile's "Bot Chat" registry row —
+            // read it from the roster cache (canonical_session, resolved
+            // server-side by name), matching either the durable row id or
+            // the compression-lineage tip currently on screen.
+            const roster = $lastRoster.get()
+            const row = Array.isArray(roster) ? roster.find(bot => bot?.name === activeBot) : null
+            const canonical = row?.canonical_session || null
             const currentId = host.activeSessionId?.get?.() ?? null
+            const canonicalIds = [canonical?.id, canonical?.resolved_id].filter(Boolean).map(String)
 
-            if (activeBot && pinnedId && currentId && String(currentId) === String(pinnedId)) {
+            if (activeBot && currentId && canonicalIds.includes(String(currentId))) {
               host.notify({
                 kind: 'info',
                 title: 'This chat never resets',
@@ -9092,75 +12642,46 @@ export default {
           }
 
           const live = {
-            name: (host.state.profile.get() || 'default').trim() || 'default',
+            name: focusedMentionProfile(),
             connectionId: String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
           }
-          const cached = typeof queryClient !== 'undefined' && queryClient && typeof queryClient.getQueryData === 'function'
-            ? queryClient.getQueryData(ROSTER_KEY)
-            : null
+          const cached = cachedUnionRoster()
           const roster = Array.isArray(cached?.profiles) ? cached.profiles : null
           let mentionedBots = roster ? resolveRosterMentions(text, roster, live) : []
 
           if (!roster) {
-            let names = []
             try {
               const res = await host.request('profiles.list', { include_sessions: false })
-              names = (res?.profiles ?? []).map(p => p.name)
+              // Same resolver as the cached path — renamed bots (display_name
+              // / ui_meta title) stay taggable when the roster cache is cold.
+              mentionedBots = resolveRosterMentions(text, res?.profiles ?? [], live).map(bot => ({ ...bot, remoteSource: false }))
             } catch {
               return draft
             }
-
-            const prose = text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ')
-            const mentioned = []
-
-            for (const match of prose.matchAll(/(^|\s)@([a-z0-9][a-z0-9_-]*)/gi)) {
-              let name = match[2].toLowerCase()
-
-              if (name === 'hermes' && !names.includes('hermes') && names.includes('default')) {
-                name = 'default'
-              }
-
-              if (names.includes(name) && name !== live.name && !mentioned.includes(name)) {
-                mentioned.push(name)
-              }
-            }
-
-            mentionedBots = mentioned.map(name => ({ name }))
           }
 
           if (!mentionedBots.length) {
             return draft
           }
 
-          const localMentions = mentionedBots.filter(bot => !bot.remoteSource)
-          const remoteMentions = mentionedBots.filter(bot => bot.remoteSource)
-
-          const activeMeta = $botMeta.get()[live.name]
-          const senderName = displayName({ name: live.name, title: activeMeta?.title }, activeMeta)
-
-          if (remoteMentions.length && typeof host.requestProfile === 'function') {
-            void deliverRemoteRosterMentions(remoteMentions, text, {
-              name: senderName,
-              handle: botHandle(live.name)
-            })
-          }
-          let note = ''
-
-          if (localMentions.length) {
-            note +=
-              '\n\n[@mention handoff — for each mentioned agent (' + localMentions.map(bot => botHandle(bot.name, bot)).join(', ') + '): ' +
-              'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim (avoid double quotes in your composed message). Send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
-              localMentions.map(bot => '`hermes -p ' + shellQuote(bot.name) + ' chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from 🤖 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(live.name)) + '): <your composed message>"`').join('\n') +
-              '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. ' +
-              'Relay the reply back to the user, attributed to that agent.]'
-          }
-
-          if (remoteMentions.length) {
-            const labels = remoteMentions.map(bot => `@${botHandle(bot.name, bot)} (${bot.connectionLabel || bot.connectionId})`).join(', ')
-            note +=
-              '\n\n[@mention — stay on this device. Desktop is delivering to ' + labels +
-              ' over Connections in the background. Do not run hermes -p for them and do not switch Gateway. Tell the user they were messaged here; when a reply lands, relay it attributed to that agent.]'
-          }
+          // Identification only. Each line names the agent the user's tag
+          // resolves to (friendly title + device for cross-connection rows),
+          // so the agent knows exactly who "@research-buddy" is. Cross-
+          // connection targets carry the '@connection' suffix message_agent
+          // resolves against the Desktop-synced relay roster.
+          const lines = mentionedBots.map(bot => {
+            const handle = botHandle(bot.name, bot)
+            const title = String(botRosterMeta(bot, $botMeta.get())?.title || bot.ui_meta?.['hermes-bots']?.title || bot.title || '').trim()
+            const target = bot.remoteSource && bot.connectionId ? `${handle}@${bot.connectionId}` : handle
+            const where = bot.remoteSource
+              ? ` — on ${bot.connectionLabel || bot.connectionId} (message_agent target: "${target}")`
+              : ''
+            return `@${handle} = agent profile "${bot.name}"${title ? ` ("${title}")` : ''}${where}`
+          })
+          const note =
+            '\n\n[@mentions resolved from the Bot Mode roster — the user is referring to: ' +
+            lines.join('; ') +
+            '. If they want one of these agents contacted, compose your own message and send it with your message_agent tool (agents on other connected machines are reachable too — the Desktop relays it); never forward the user\u2019s text verbatim. If this session has no message_agent tool, agent messaging is unavailable here — say so.]'
 
           return { ...draft, text: text + note }
         }      }

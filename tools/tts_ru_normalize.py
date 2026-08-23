@@ -54,40 +54,33 @@ def normalize_symbols_cyrillic(text: str, lang: str) -> str:
     text = re.sub("[   ]", " ", text)
     text = text.replace("−", "-")
 
-    # temperature range: "N–M °C" -> "N to M degrees"
     text = re.sub(
         r"(?<!\w)([+\-]?\d+(?:[.,]\d+)?)\s*[–—…\-]+\s*([+\-]?\d+(?:[.,]\d+)?)\s*°\s*[CСcс]",
         lambda m: f"{_sign(m.group(1), plus, minus)} {to} {_sign(m.group(2), plus, minus)} {deg}",
         text,
     )
-    # single temperature: "N °C"
     text = re.sub(
         r"(?<!\w)([+\-]?\d+(?:[.,]\d+)?)\s*°\s*[CСcс]",
         lambda m: f"{_sign(m.group(1), plus, minus)} {deg}",
         text,
     )
-    # bare degree
     text = re.sub(r"°\s*[CСcс]", deg, text)
     text = text.replace("°", " " + deg)
 
-    # weather / travel units (latin + cyrillic forms)
     text = re.sub(r"(?<=\d)\s*(?:km\s*/\s*h|км\s*/\s*год|км\s*/\s*ч)\b", " " + kmh, text, flags=re.IGNORECASE)
     text = re.sub(r"(?<=\d)\s*(?:m\s*/\s*s|м\s*/\s*с)\b", " " + mps, text, flags=re.IGNORECASE)
     text = re.sub(r"(?<=\d)\s*(?:mm|мм)\b", " " + mm, text, flags=re.IGNORECASE)
     text = re.sub(r"(?<=\d)\s*(?:cm|см)\b", " " + cm, text, flags=re.IGNORECASE)
     text = re.sub(r"(?<=\d)\s*%", " " + pct, text)
 
-    # numeric range without unit: "+18…+20"
     text = re.sub(
         r"(?<!\w)([+\-]\d+(?:[.,]\d+)?)\s*[–—…]+\s*([+\-]?\d+(?:[.,]\d+)?)",
         lambda m: f"{_sign(m.group(1), plus, minus)} {to} {_sign(m.group(2), plus, minus)}",
         text,
     )
-    # standalone sign before a number (not after a word/digit -> keeps dates safe)
     text = re.sub(r"(?<![\w])\+(?=\d)", plus + " ", text)
     text = re.sub(r"(?<![\w])-(?=\d)", minus + " ", text)
 
-    # leftovers
     text = text.replace("…", " " + to + " ")
     text = re.sub("[•◦▪▫]", " ", text)
     text = text.replace("→", " " + to + " ")

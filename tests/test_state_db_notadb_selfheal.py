@@ -52,16 +52,12 @@ class TestReconnectAfterNotADb:
         db = SessionDB(db_path=tmp_path / "state.db")
         try:
             db.create_session(session_id="s1", source="cli", model="test")
-            # Simulate the runtime corruption class: the connection starts
-            # raising 'file is not a database' while the on-disk file is
-            # perfectly healthy (sibling replaced/truncated the old inode).
             db._conn = _NotADbOnce(db._conn)
 
             db.create_session(session_id="s2", source="cli", model="test")
 
             assert db._notadb_reconnect_attempted is True
             assert db.get_session("s2") is not None
-            # The pre-existing row survived (same on-disk file).
             assert db.get_session("s1") is not None
         finally:
             db.close()
@@ -115,7 +111,6 @@ class TestOnDiskJournalModeEioRetry:
         conn = MagicMock()
         conn.execute.side_effect = sqlite3.OperationalError("disk i/o error")
         assert _on_disk_journal_mode(conn) is None
-        # Bounded: retried a handful of times, not forever.
         assert conn.execute.call_count == 4
 
     def test_non_eio_operational_error_fails_fast(self):

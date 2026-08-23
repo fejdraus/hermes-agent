@@ -34,9 +34,6 @@ class _SessionState:
     atif_subscriber_name: str = ""
     is_embedded_subagent: bool = False
     parent_session_id: str = ""
-    # Flipped when a Relay scope operation for this session raises — an
-    # errored session's exporter state is unreliable and its export can be
-    # pathologically slow, so close_session skips the ATIF export for it.
     scope_errored: bool = False
 
 
@@ -62,10 +59,6 @@ class _Settings:
     atif_agent_name: str = "Hermes Agent"
     atif_agent_version: str = "unknown"
     atif_model_name: str = "unknown"
-    # Wall-clock budget for one session's ATIF export (serialize + write).
-    # A multi-day session's trace can take minutes to serialize; when the
-    # export runs inside a session-finalize hook that budget is somebody
-    # else's shutdown window. <= 0 disables the bound.
     atif_export_timeout_s: float = 30.0
 
 
@@ -412,25 +405,10 @@ class _Runtime:
                 state.relay_session,
                 callback,
                 *args,
-                # Bounded: this wrapper serves every mark/event the plugin
-                # emits (turn start/end, approvals, subagent marks), and it
-                # runs synchronously on the agent's conversation thread. The
-                # host default (timeout=None) is an UNBOUNDED native call —
-                # a wedged native Relay pipeline then blocks the agent
-                # between API calls with zero activity ticks until the cron
-                # 600s inactivity kill / gateway idle timeout fires (the
-                # core's scope push/pop/flush sites were bounded for the
-                # same reason after the 2026-08-10 delegation stall; these
-                # plugin marks were the missed sibling class). On breach we
-                # lose one telemetry span, never the agent.
                 timeout=relay_runtime._SCOPE_OP_TIMEOUT,
                 **kwargs,
             )
         except TimeoutError:
-            # A wedged native pipeline is a session-level condition, not a
-            # one-off: flag it so close_session skips the (potentially very
-            # slow) ATIF export, and warn ONCE so the sick pipeline is
-            # visible before it costs anything bigger.
             if not state.scope_errored:
                 logger.warning(
                     "Relay scope operation for session %s exceeded %.0fs; "
@@ -442,9 +420,6 @@ class _Runtime:
             state.scope_errored = True
             raise
         except Exception:
-            # A failed scope operation leaves the session's Relay/exporter
-            # state unreliable; remember it so close_session can skip the
-            # (potentially very slow) ATIF export for this session.
             state.scope_errored = True
             raise
 
@@ -476,17 +451,12 @@ class _Runtime:
             _export()
             return
 
-        # Bounded: export_json() on a long session can take minutes, and
-        # close_session runs inside session-finalize/shutdown paths where
-        # that time is somebody else's stop window. On timeout the worker
-        # thread finishes (or leaks) on its own; the partial file, if any,
-        # is overwritten by the next successful export.
         error: dict[str, BaseException] = {}
 
         def _runner() -> None:
             try:
                 _export()
-            except BaseException as exc:  # re-raised below when it beat the clock
+            except BaseException as exc:
                 error["exc"] = exc
 
         thread = threading.Thread(
@@ -585,15 +555,6 @@ class _Runtime:
 
     def mark(self, name: str, kwargs: dict[str, Any]) -> None:
         state = self.ensure_session(kwargs)
-        # Prefer the live turn scope over the session scope. Scope events
-        # export when their OWNING scope closes: turn scopes close every
-        # turn, session scopes only at session end. Parenting marks to the
-        # session means a long-lived conversation emits nothing for hours
-        # (and nothing at all if the process dies first), so approval and
-        # turn marks were invisible on audit dashboards until the operator
-        # happened to end the session. Turn scopes give per-turn export
-        # with the same parentage semantics — the turn is a child of the
-        # session, so the session tree is unchanged.
         handle = state.handle
         turn = relay_runtime.active_turn(state.session_id)
         if turn is not None and turn.handle is not None:
@@ -642,8 +603,6 @@ def register(ctx) -> None:
         _SESSION_INITIALIZER_NAME,
         _prepare_core_session,
     )
-    # Activate dynamic plugins before Hermes installs the managed execution
-    # boundaries that invoke their interceptors.
     if _load_settings().dynamic_plugins:
         _get_runtime()
     ctx.register_hook("on_session_start", on_session_start)

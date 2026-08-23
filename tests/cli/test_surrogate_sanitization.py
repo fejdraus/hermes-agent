@@ -29,15 +29,12 @@ class TestSanitizeSurrogates:
         assert result == "Hello \ufffd world"
 
 
-
     def test_result_is_json_serializable(self):
         """Sanitized text must survive json.dumps + utf-8 encoding."""
         dirty = "data \udce2\udcb0 from clipboard"
         clean = _sanitize_surrogates(dirty)
         serialized = json.dumps({"content": clean}, ensure_ascii=False)
-        # Must not raise UnicodeEncodeError
         serialized.encode("utf-8")
-
 
 
 class TestSanitizeMessagesSurrogates:
@@ -68,7 +65,6 @@ class TestSanitizeMessagesSurrogates:
         assert _sanitize_messages_surrogates(msgs) is True
         assert "\ufffd" in msgs[0]["content"][0]["text"]
         assert "\udce2" not in msgs[0]["content"][0]["text"]
-
 
 
     def test_tool_messages_sanitized(self):
@@ -130,11 +126,9 @@ class TestReasoningFieldSurrogates:
             },
         ]
         _sanitize_messages_surrogates(msgs)
-        # Must round-trip through json + utf-8 encoding without error
         payload = json.dumps(msgs, ensure_ascii=False).encode("utf-8")
-        assert b"\\" not in payload[:0]  # sanity — just ensure we got bytes
+        assert b"\\" not in payload[:0]
         assert len(payload) > 0
-
 
 
 class TestSanitizeStructureSurrogates:
@@ -146,11 +140,6 @@ class TestSanitizeStructureSurrogates:
         assert _sanitize_structure_surrogates(payload) is True
         assert payload["a"] == "clean"
         assert "\ufffd" in payload["b"]
-
-
-
-
-
 
 
 class TestApiMessagesSurrogateRecovery:
@@ -182,7 +171,6 @@ class TestApiMessagesSurrogateRecovery:
         ]
         assert _sanitize_messages_surrogates(api_messages) is True
         assert "\udce2" not in api_messages[1]["reasoning_content"]
-        # Full payload must now serialize clean
         json.dumps(api_messages, ensure_ascii=False).encode("utf-8")
 
 
@@ -198,7 +186,6 @@ class TestRunConversationSurrogateSanitization:
 
         mock_sys.return_value = "system prompt"
 
-        # Mock streaming to return a simple response
         mock_choice = MagicMock()
         mock_choice.message.content = "response"
         mock_choice.message.tool_calls = None
@@ -218,13 +205,11 @@ class TestRunConversationSurrogateSanitization:
         agent = AIAgent(model="test/model", api_key="test-key", base_url="http://localhost:1234/v1", quiet_mode=True, skip_memory=True, skip_context_files=True)
         agent.client = MagicMock()
 
-        # Pass a message with surrogates
         result = agent.run_conversation(
             user_message="test \udce2 message",
             conversation_history=[],
         )
 
-        # The message stored in history should have surrogates replaced
         for msg in result.get("messages", []):
             if msg.get("role") == "user":
                 assert "\udce2" not in msg["content"], "Surrogate leaked into stored message"

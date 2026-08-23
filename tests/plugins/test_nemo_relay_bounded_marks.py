@@ -74,7 +74,6 @@ def test_timeout_breach_flags_session_and_skips_atif_export():
 
     assert state.scope_errored is True
 
-    # export_atif must now skip without touching the exporter.
     class _ExplodingExporter:
         def export_json(self):  # pragma: no cover - must not be called
             raise AssertionError("export ran for a scope-errored session")
@@ -83,7 +82,7 @@ def test_timeout_breach_flags_session_and_skips_atif_export():
     runtime.settings = plugin._Settings(
         atif_enabled=True, atif_output_directory="/tmp/never-used"
     )
-    runtime.export_atif(state)  # no raise, no export
+    runtime.export_atif(state)
 
 
 def test_non_timeout_errors_still_flag_session():

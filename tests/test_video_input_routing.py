@@ -35,7 +35,6 @@ def test_enabled_by_agent_flag():
 def test_fps_read_and_range_checked():
     assert video_input_fps({"agent": {"video_fps": 2}}) == 2.0
     assert video_input_fps({"agent": {}}) is None
-    # outside MiniMax's documented 0.2-5 window: fall back to provider default
     assert video_input_fps({"agent": {"video_fps": 9}}) is None
     assert video_input_fps({"agent": {"video_fps": "nonsense"}}) is None
 

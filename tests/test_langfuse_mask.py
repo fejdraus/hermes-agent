@@ -29,7 +29,7 @@ def test_video_data_uri_masked_too():
 
 def test_truncated_uri_masked_not_decoded():
     """A cut URI is exactly what produced the padding errors."""
-    out = lf._mask_data_uris(data="data:image/png;base64,AAA")  # invalid padding
+    out = lf._mask_data_uris(data="data:image/png;base64,AAA")
     assert out["omitted"] is True
 
 

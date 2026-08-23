@@ -87,8 +87,6 @@ import { recordToolDiff } from '@/store/tool-diffs'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
 import { reportInstallMethodWarning } from '@/store/updates'
 import { notifyWorkspaceChanged, toolChangedPath, toolMayMutateFiles } from '@/store/workspace-events'
-// Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
-// module graph into the gateway event hot path.
 import { ingestBackendSkin } from '@/themes/backend-sync'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -125,9 +123,6 @@ function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined
     return true
   }
 
-  // A named session cannot describe a fresh draft. Treating a null selection as
-  // a wildcard let a background tile's `session.info` rehome the draft to the
-  // tile's workspace.
   if (!selected) {
     return false
   }
@@ -136,8 +131,6 @@ function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined
     return true
   }
 
-  // Either id may be the live tip or the lineage root, so ask whether ONE row
-  // answers to both rather than assuming which side rotated.
   return $sessions
     .get()
     .some(session => sessionMatchesStoredId(session, infoStoredSessionId) && sessionMatchesStoredId(session, selected))
@@ -169,7 +162,6 @@ function surfaceBillingBlock(sessionId: string, raw: unknown): void {
   }
 
   notify({
-    // Collapse repeat walls from the same provider into one toast.
     id: `billing-block:${block.provider}`,
     kind: 'warning',
     icon: 'credit-card',
@@ -177,7 +169,6 @@ function surfaceBillingBlock(sessionId: string, raw: unknown): void {
       ? translateNow('billingBlock.titleNous')
       : translateNow('billingBlock.titleProvider', block.provider_label),
     message: firstBillingLine(block.message) || translateNow('billingBlock.fallbackMessage'),
-    // Sticky: a credit wall blocks every turn until resolved.
     durationMs: 0,
     action: { label: billingCtaLabel(block, ctaCopy), onClick: () => runBillingRecovery(block) }
   })
@@ -303,12 +294,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
   const unscopedStreamSessionIdRef = useRef<string | null>(null)
 
-  // session.info arrives in bursts (agent build ready + turn end + title /
-  // MCP / compress edges within the same second). Each used to fire its own
-  // refreshHermesConfig — two REST calls (config + defaults) per event, per
-  // turn, including for BACKGROUND sessions whose values the fetch can't even
-  // apply. Coalesce to one trailing fetch per burst; the caller gates on
-  // `apply` so background traffic doesn't schedule anything.
   const configRefreshTimerRef = useRef<null | number>(null)
 
   const scheduleConfigRefresh = useCallback(() => {
@@ -342,12 +327,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
 
-      // "From the active profile" must mean "from the active SOURCE": every
-      // registered connection exposes a 'default' profile, so a bare profile
-      // comparison attributes gateway B's 'default' events to gateway A's
-      // 'default'. Compare the composite (connectionId, profile) scope with
-      // registryBackendScopeKey — untagged primary events keep the legacy
-      // bare-profile behavior byte-identical.
       const fromActiveSource = (): boolean =>
         (!event.profile || normalizeProfileKey(event.profile) === normalizeProfileKey($activeGatewayProfile.get())) &&
         registryBackendScopeKey(event.connectionId ?? null, event.profile ?? null) ===
@@ -375,12 +354,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const sessionId = route.sessionId
 
-      // Late stragglers: an unscoped stream event attributed via the
-      // active-session fallback (no pin) to a session that has no live turn
-      // belongs to a turn that already ended elsewhere. Dropping it keeps the
-      // previous session's tail events (a delayed `thinking.delta` or
-      // `status.update`) from landing in a freshly opened chat (#43142 family:
-      // busy/streaming UI inherited when switching sessions).
       if (
         sessionId &&
         !explicitSid &&
@@ -408,10 +381,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         void replayPendingApproval($gateway.get(), replaySessionId).catch(() => undefined)
       }
 
-      // Mid-turn compaction does not emit another message.start. The first
-      // model output or tool event proves summarization has finished and the
-      // turn has resumed, so retire the phase label without waiting for the
-      // whole turn to complete.
       if (sessionId && COMPACTION_RESUME_EVENT_TYPES.has(event.type) && compactedTurnRef.current.has(sessionId)) {
         setSessionCompacting(sessionId, false)
       }
@@ -425,17 +394,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       }
 
       if (event.type === 'gateway.ready') {
-        // Seed the active skin into the desktop theme registry without applying,
-        // so a fresh connect never overrides the user's persisted desktop theme.
         ingestBackendSkin((payload as { skin?: HermesSkin } | undefined)?.skin, { apply: false })
-        // Backends with the change watcher broadcast pet/cron/sessions change
-        // events; consumers demote their legacy polls to slow backstops.
         setChangeEventsAvailable(Boolean((payload as { change_events?: boolean } | undefined)?.change_events))
 
         return
       } else if (event.type === 'skin.changed') {
-        // A runtime skin switch (Hermes activating an authored skin, or `/skin`
-        // on another surface). Only the active source+profile's change repaints.
         if (fromActiveSource()) {
           ingestBackendSkin(payload as HermesSkin | undefined, { apply: true })
         }
@@ -448,11 +411,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         event.type === 'platforms.changed' ||
         event.type === 'pairing.changed'
       ) {
-        // Change-watcher broadcasts (server._broadcast_watched_changes): the
-        // backend's on-disk signature moved. Route to the live-sync ticks the
-        // former pollers now subscribe to. Only the active source+profile's
-        // changes apply — background profile sockets (and other connections'
-        // gateways) watch their own homes.
         if (fromActiveSource()) {
           if (event.type === 'pet.changed') {
             notifyPetChanged(payload as PetChangeMeta | undefined)
@@ -469,89 +427,43 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         return
       } else if (event.type === 'session.reclaimed') {
-        // The backend reclaimed a live session we may still be holding (idle
-        // TTL, LRU cap, or the WS-orphan reap). Without this the runtime id
-        // stays cached until something fails against it, which reads as the
-        // session vanishing rather than being reclaimed. Drop the cached state
-        // now — the stored row is untouched, so the sidebar keeps the
-        // conversation and reopening it resumes from the DB.
         const reclaimedRuntimeId = String((payload as { session_id?: string } | undefined)?.session_id ?? '')
 
         if (reclaimedRuntimeId) {
           dropSessionState(reclaimedRuntimeId)
-          // A tile bound to the reclaimed runtime would otherwise render an
-          // empty transcript forever: its view reads $sessionStates[runtime]
-          // (just dropped) and its resume effect is gated on !runtimeId, so a
-          // bound tile never re-resumes (#82620). Unbind it so the effect
-          // refires against the intact stored session — and purge the wiring
-          // cache's entry, or resumeTile's warm path would hand the dead
-          // runtime straight back instead of cold-resuming a live one.
           unbindTileRuntime(reclaimedRuntimeId)
           sessionStateByRuntimeIdRef.current.delete(reclaimedRuntimeId)
         }
 
-        // The row's ended_at moved, so refresh the lists that render it.
         notifySessionsChanged()
 
         return
       } else if (event.type === 'session.info') {
-        // Apply session-scoped fields when the event targets the active
-        // session, OR when it's a global broadcast and we have no session.
         const apply = explicitSid ? isActiveEvent : !activeSessionIdRef.current
         const statePatch = sessionInfoStatePatch(payload)
         const hasStatePatch = hasSessionInfoStatePatch(statePatch)
         const modelChanged = typeof payload?.model === 'string'
         const providerChanged = typeof payload?.provider === 'string'
         const runningChanged = typeof payload?.running === 'boolean'
-        // The backend stamps model/provider (as strings) on EVERY session.info,
-        // so the presence flags above are true on every heartbeat/turn edge —
-        // fine for the cheap atom writes below (nanostores skips identical
-        // values), but they also drove queryClient.invalidateQueries, refetching
-        // the model-options provider catalog once or twice per turn for a model
-        // that never changed. Only a genuine VALUE change (vs the session's own
-        // cached runtime state, captured before the state patch below applies;
-        // composer atoms as the fallback for an uncached session) invalidates.
         const knownState = sessionId ? sessionStateByRuntimeIdRef.current.get(sessionId) : undefined
         const modelValueChanged = modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
 
         const providerValueChanged =
           providerChanged && payload!.provider !== (knownState?.provider ?? $currentProvider.get())
 
-        // Config is profile-scoped, but session.info also arrives for background
-        // sessions. Only an active-session event from the currently active
-        // gateway may reconcile the foreground cache. Requiring the renderer's
-        // source tag prevents an event queued before a profile swap from being
-        // attributed to the newly active profile.
         if (isActiveEvent && typeof payload?.approval_mode === 'string' && event.profile && fromActiveSource()) {
           reconcileApprovalModeForProfile(event.profile, payload.approval_mode)
         }
 
         if (apply) {
-          // Do not call setCurrentModel / setCurrentProvider here. Composer
-          // model/provider is sticky UI state (localStorage + manual picks).
-          // Periodic session.info heartbeats often carry the profile default
-          // (or a stale session model) and would silently revert the dropdown.
-          // Active-session model/provider still flows through the session state
-          // cache via updateSessionState → syncRuntimeMetadataToView below.
 
           if (typeof payload?.cwd === 'string' && sessionInfoDescribesSelectedSession(payload.stored_session_id)) {
-            // The active session's agent can relocate itself (new repo/worktree
-            // via the terminal). When the SAME active session's cwd actually
-            // moves, follow it — refresh the project tree + scope so the sidebar
-            // tracks the live thread. A fresh selection (different session id)
-            // is a switch, not a move, so it refreshes data without yanking scope.
             const cwdMoved = payload.cwd !== $currentCwd.get()
             const sameSession = !!sessionId && sessionId === lastCwdInfoSessionRef.current
 
             lastCwdInfoSessionRef.current = sessionId
             setCurrentCwdTransient(payload.cwd)
 
-            // The backend just confirmed the selected conversation's real
-            // workspace, so it owns the path we wrote. Without the claim the
-            // marker keeps naming whoever held it before — including the
-            // released state a detached resume leaves behind — and the primary
-            // workspace-derived surfaces stay hidden against a folder the
-            // backend has confirmed (#71254).
             setWorkspaceCwdOwner($selectedStoredSessionId.get())
 
             if (cwdMoved && sameSession) {
@@ -601,19 +513,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           )
         }
 
-        // The running→busy transition must reach EVERY session, not just the
-        // active one. The `apply` gate above correctly scopes view-only side
-        // effects (setCurrentCwd, etc.) to the focused chat,
-        // but the per-session busy state is what drives the sidebar working
-        // indicator — a background session's turn start/finish must update
-        // its dot without the user opening it. updateSessionState only
-        // mutates the per-runtime cache entry, and syncSessionStateToView
-        // guards the view publish to the active session, so this is safe.
         if (runningChanged && sessionId) {
-          // Set when THIS event released a turn that ended without ever
-          // producing an assistant payload, so the catch-up side effects below
-          // run on that edge only. The updater is invoked exactly once,
-          // synchronously, by updateSessionState.
           let recoveredWithoutPayload = false
 
           const nextState = updateSessionState(
@@ -626,17 +526,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               }
 
               if (busy) {
-                // Don't re-arm busy from a stale session.info if the user
-                // just clicked Stop (interrupted=true). The backend's
-                // cooperative interrupt may not have propagated yet, so
-                // running is still true in the heartbeat. The turn's
-                // finally block will emit running=false to clear busy.
                 if (state.interrupted) {
                   return state
                 }
 
-                // Prefer the gateway-reported turn_started_at so the timer
-                // survives session switches and session.info heartbeats.
                 const gatewayTurnStartedAt =
                   typeof payload!.turn_started_at === 'number' && payload!.turn_started_at > 0
                     ? payload!.turn_started_at * 1000
@@ -645,37 +538,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 return {
                   ...state,
                   busy,
-                  // running=true from the backend is turn-live proof, same as
-                  // message.start (e.g. resuming an already-running session
-                  // that never replays its start event).
                   turnLive: true,
                   turnStartedAt: state.turnStartedAt ?? gatewayTurnStartedAt ?? Date.now()
                 }
               }
 
-              // The turn has not started backend-side yet. submit arms
-              // busy/awaitingResponse optimistically, so a running=false
-              // heartbeat that lands in the gap before the turn spins up is a
-              // pre-start report, not a finished turn — settling on it would
-              // drop the spinner and re-open the send guard mid-flight.
-              // turnLive is stamped only once the backend reports the turn
-              // live (message.start, the running=true edge, or a resumed
-              // in-flight turn) and is cleared by every settle, so false
-              // here is exactly "no turn has been reported running yet".
-              // (turnStartedAt can't discriminate — it is optimistically
-              // seeded at submit so the visible timer starts at Enter.)
-              //
-              // BOUNDED (#86795): an armed turn that never goes live — a
-              // restore/edit whose rewind was refused after the optimistic
-              // arm, a submit response lost to a gateway bounce, a terminal
-              // error event that never arrived — would otherwise hold this
-              // gate forever. busy then latches until app restart:
-              // isTargetSessionBusy refuses every send, the composer queues
-              // each message, and the queue drain (gated on busy→false) never
-              // fires. turnStartedAt is seeded at the optimistic arm, so its
-              // age bounds the hold; past the grace window (or with no clock
-              // at all) the gateway's running=false is authoritative and the
-              // settle below releases the session.
               const armedAt = state.turnStartedAt
 
               const withinPreStartGrace =
@@ -685,30 +552,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 return state
               }
 
-              // Past that gate the turn DID start and the backend now reports it
-              // finished. When no assistant payload ever arrived (gateway crash
-              // mid-stream, provider error before the first delta, agent-build
-              // failure) message.complete never fires, so this is the only event
-              // that can release the session. Bailing here instead left
-              // awaitingResponse/busy latched until app restart (#46517): the
-              // per-session busy flag is authoritative for isTargetSessionBusy,
-              // so submitPrompt and the slash dispatcher silently returned false
-              // and the session accepted no further input.
               recoveredWithoutPayload = state.awaitingResponse && !state.sawAssistantPayload
 
               return {
                 ...state,
                 awaitingResponse: false,
                 busy,
-                // The turn is over but its streaming bubble may still say
-                // pending — running=false from the agent loop's finally block
-                // is the ONLY settle signal when message.complete never
-                // arrives (turn crash, reconnect gap). Left pending, that
-                // bubble shows a thinking indicator forever, stranded
-                // mid-transcript once the next user message lands after it.
-                // finalizeInterruptedMessages un-pends kept text and drops
-                // empty placeholders; on the normal path message.complete
-                // already settled everything and this is a no-op.
                 messages: finalizeInterruptedMessages(state.messages, state.streamId, occurredAt),
                 pendingBranchGroup: null,
                 streamId: null,
@@ -720,19 +569,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           )
 
           if (recoveredWithoutPayload) {
-            // Stays unscoped, like the settle above: a background session's
-            // sidebar row has to drop its working dot without the user opening
-            // it. This fires on the recovery edge only — once awaitingResponse
-            // is false the `state.busy === busy` guard above short-circuits
-            // every later heartbeat — so it costs one coalesced refresh per
-            // broken turn, not one per tick.
             scheduleSessionsRefresh()
 
-            // The transcript catch-up IS scoped. The stream died, but the turn
-            // itself may have completed and been persisted, so refetch stored
-            // history for the session actually on screen; a background session
-            // reads its history when the user opens it, and hydrating every one
-            // of them here would fan a REST call out per idle session.
             if (isActiveEvent) {
               void hydrateFromStoredSession(3, nextState.storedSessionId, sessionId)
             }
@@ -747,10 +585,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (apply) {
           reportInstallMethodWarning(payload?.install_warning)
-          // Config refetch is only meaningful for the foreground context —
-          // everything refreshHermesConfig applies is either active-session
-          // guarded or a composer/global pref. Background sessions' heartbeats
-          // used to trigger it too (two REST calls each, every turn).
           scheduleConfigRefresh()
         }
 
@@ -761,12 +595,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'session.usage') {
-        // Live usage tick emitted while a turn is mid-flight (see tui_gateway
-        // _start_usage_ticker) so the status-bar context window tracks growth
-        // during the turn instead of only jumping at message.complete.
         if (payload?.usage && sessionId) {
-          // Per-session twin first: a focused secondary tile reads this cache,
-          // while the primary-only global mirrors the active session.
           updateSessionState(sessionId, state => ({
             ...state,
             usage: { calls: 0, input: 0, output: 0, total: 0, ...state.usage, ...payload.usage }
@@ -786,18 +615,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         setSessionCompacting(sessionId, false)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
-        // A fresh turn on this session optimistically clears its billing wall;
-        // if credits are still exhausted the next failure re-raises it.
         clearBillingBlock(sessionId)
 
         if (isActiveEvent) {
           triggerHaptic('streamStart')
         }
 
-        // Submit→accept latency: seedOptimistic armed the clock at Enter; this
-        // event is the backend accepting the turn. Debug-only visibility into
-        // how long the arm actually took (the "no progress box for seconds"
-        // complaint) — reads the pre-update cache, costs nothing when clean.
         const seededAt = sessionStateByRuntimeIdRef.current.get(sessionId)?.turnStartedAt
 
         if (typeof seededAt === 'number') {
@@ -805,13 +628,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         updateSessionState(sessionId, state => {
-          // If the user clicked Stop (cancelRun set interrupted=true), don't
-          // let a stale message.start from a chained turn (goal follow-up,
-          // completion drain) or an in-flight LLM response re-arm busy.
-          // The interrupt is user intent — the backend's cooperative cancel
-          // may not have propagated yet, so its events are stale. The turn's
-          // finally block will emit session.info with running=false to clear
-          // busy for real once the agent loop actually exits.
           if (state.interrupted) {
             return state
           }
@@ -823,23 +639,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             sawAssistantPayload: false,
             interrupted: false,
             interimBoundaryPending: false,
-            // Backend accepted the turn — the no-payload settle gate below may
-            // now treat a running=false heartbeat as a real turn end.
             turnLive: true,
-            // Keep the submit-time seed (submit.ts seedOptimistic) — resetting
-            // here would hide the submit→accept round trip from the timer.
-            // Backend-originated turns (queue drain elsewhere, goal follow-up)
-            // have no seed and arm here.
             turnStartedAt: state.turnStartedAt ?? Date.now()
           }
         })
 
         if (isActiveEvent) {
-          // Belt-and-suspenders mirror of the ACTIVE session's per-session
-          // clock (the load-bearing mirror is the view-sync flush in
-          // use-session-state-cache). Mirror the seeded value, not Date.now():
-          // resetting to accept-time here would visibly snap the timer back
-          // after the submit-time seed above already started it.
           setTurnStartedAt(sessionStateByRuntimeIdRef.current.get(sessionId)?.turnStartedAt ?? Date.now())
         }
       } else if (event.type === 'message.delta') {
@@ -847,10 +652,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           appendAssistantDelta(sessionId, coerceGatewayText(payload?.text), occurredAt)
         }
       } else if (event.type === 'message.interim') {
-        // The agent emitted interim assistant commentary (text alongside tool
-        // calls, or the attempted final answer before a verify-on-stop nudge).
-        // Finalize it as its own sealed bubble so message.complete doesn't wipe
-        // it — the text was already streamed via message.delta and is visible.
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           const text = coerceGatewayText(payload?.text)
@@ -860,16 +661,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
         }
       } else if (event.type === 'thinking.delta') {
-        // Most thinking.delta frames are kawaii spinner rewrites and stay out
-        // of the transcript. Explained provider waits are different: the core
-        // emits them after prolonged silence, so name that wait in the existing
-        // bottom-of-thread status row instead of leaving only an unlabeled timer.
         if (sessionId) {
           setSessionProviderWait(sessionId, providerWaitText(coerceGatewayText(payload?.text)))
         }
       } else if (event.type === 'reaction') {
-        // Core-detected affection (ily / <3 / good bot) on the user's message.
-        // Play hearts only for the visible session so background turns stay quiet.
         if (isActiveEvent && (payload?.kind ?? 'vibe') === 'vibe') {
           burstVibeHearts()
         }
@@ -890,10 +685,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setPetActivity({ reasoning: true })
         }
       } else if (event.type === 'moa.reference') {
-        // MoA reference-model output — surface as a labelled thinking chunk
-        // (tagged with the source model) before the aggregator's response, so
-        // the mixture-of-agents process is visible. Reuses the reasoning
-        // disclosure rather than introducing a parallel surface.
         if (sessionId) {
           const label = coerceGatewayText(payload?.label) || 'reference'
           const idx = typeof payload?.index === 'number' ? payload.index : undefined
@@ -903,20 +694,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const text = `${header}\n${body}\n\n`
 
           if (idx === undefined || idx <= 1) {
-            // First reference: clear any stale reasoning left over from
-            // before this turn's references start, same as before.
             appendReasoningDelta(sessionId, text, true, occurredAt)
           } else {
-            // Later references must accumulate, not replace — otherwise
-            // each new reference wipes out the ones already shown (#64658).
-            // Queue-then-flush (rather than the streamed/batched queue path)
-            // applies it immediately, since each reference arrives as one
-            // complete block rather than incremental tokens. reasoning.delta
-            // cannot be mid-flight here: MoAChatCompletions.reference_callback
-            // (agent/moa_loop.py) fires "moa.reference" once per reference's
-            // already-complete text, with no concurrent token stream for the
-            // reference-gathering phase, so there is no in-flight delta to
-            // collide with in the shared queue bucket.
             appendReasoningDelta(sessionId, text, false, occurredAt)
             flushQueuedDeltas(sessionId)
           }
@@ -926,17 +705,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setPetActivity({ reasoning: true })
         }
       } else if (event.type === 'moa.aggregating') {
-        // Status transition only; the aggregator's reply arrives via the normal
-        // message stream. No reasoning/transcript mutation here.
         if (isActiveEvent) {
           setPetActivity({ reasoning: true })
         }
       } else if (event.type === 'moa.progress') {
-        // Live reference fan-out progress ("refs k/n") — surfaced in the same
-        // reasoning disclosure the references land in. These lines arrive
-        // BEFORE any moa.reference event (references are only emitted once the
-        // whole fan-out completes), and the first moa.reference replaces the
-        // block, so the progress trail is self-cleaning.
         if (sessionId && typeof payload?.refs_done === 'number' && typeof payload?.refs_total === 'number') {
           const label = coerceGatewayText(payload?.label)
 
@@ -952,9 +724,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setPetActivity({ reasoning: true })
         }
       } else if (event.type === 'moa.phase') {
-        // Phase transition — currently only phase="aggregator" (fan-out done,
-        // aggregator acting). Append a one-line marker; the first
-        // moa.reference that follows replaces the whole block.
         if (sessionId && payload?.phase === 'aggregator') {
           appendReasoningDelta(sessionId, '◇ MoA aggregating…\n', false, occurredAt)
           flushQueuedDeltas(sessionId)
@@ -968,28 +737,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           return
         }
 
-        // Turn ended — drop any blocking prompt still open for THIS session
-        // (e.g. interrupted, or the approval already resolved). Scoped to the
-        // session so a background turn finishing can't wipe the active chat's
-        // prompt, and vice versa.
         clearAllPrompts(sessionId)
         clearClarifyRequest(undefined, sessionId)
-        // Turn ended without a final `todo` update — drop a still-unfinished
-        // list so "Tasks N/M" doesn't stay pinned above the composer with the
-        // last item stuck pending/in_progress. Finished lists keep their linger.
         clearActiveSessionTodos(sessionId)
         setSessionCompacting(sessionId, false)
 
         flushQueuedDeltas(sessionId)
 
-        // Keyed by session so only one window beeps when several are open.
         playCompletionSound(sessionId)
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
 
-        // Terminal error frames (status "error") carry the failure in
-        // structured fields: `error` is the message, and `partial` marks
-        // `text` as streamed output to keep rather than the error string.
         const failure =
           payload?.status === 'error'
             ? {
@@ -1000,8 +758,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure, occurredAt)
 
-        // Structured billing wall forwarded by the gateway (out of credits /
-        // payment required) — cache it + raise a billing-specific toast.
         if (payload?.billing) {
           surfaceBillingBlock(sessionId, payload.billing)
         }
@@ -1009,25 +765,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (isActiveEvent) {
           setTurnStartedAt(null)
 
-          // Pet beat: a finished turn always celebrates — go straight to the
-          // jump, never linger on the run/reason pose. One atom update (clears
-          // toolRunning/reasoning AND sets celebrate together) so no stray "run"
-          // frame leaks to the sprite — including the popped-out overlay, which
-          // mirrors each activity change. The jump runs ~2 loops, then settles.
           flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
 
-          // Light up the pet's mail icon if the user wasn't looking when the turn
-          // finished — a glanceable "new message" hint on the popped-out overlay.
-          // Cleared when they open the app via the mail icon or refocus the window.
           if (typeof document !== 'undefined' && !document.hasFocus()) {
             markPetUnread()
           }
         }
 
         if (payload?.usage) {
-          // Per-session twin FIRST (the statusbar reads it for focused tiles);
-          // the primary-only global mirrors the ACTIVE session — ungated it
-          // let a background tile's turn overwrite the primary's count.
           updateSessionState(sessionId, state => ({
             ...state,
             usage: { calls: 0, input: 0, output: 0, total: 0, ...state.usage, ...payload.usage }
@@ -1038,7 +783,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
         }
       } else if (event.type === 'session.title') {
-        // Live auto-title push (titler runs async, after the turn's refresh).
         const storedId = typeof payload?.session_id === 'string' ? payload.session_id : ''
         const nextTitle = typeof payload?.title === 'string' ? payload.title.trim() : ''
 
@@ -1046,15 +790,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setSessions(prev => prev.map(s => (sessionMatchesStoredId(s, storedId) ? { ...s, title: nextTitle } : s)))
         }
       } else if (event.type === 'tool.generating') {
-        // Announced while the model is still emitting the call's JSON, so it
-        // carries a name and nothing else — no id, no args. Materializing a row
-        // from it strands an argless placeholder whenever the bubble is sealed
-        // before the real `tool.start` arrives, because the two can no longer be
-        // reconciled across the boundary. It's a status, so say it as one.
-        // A stopped turn can still emit a frame or two before the backend
-        // notices, and naming a tool we will never run leaves the label up
-        // until something else retires it. `mutateStream` drops late tool rows
-        // on the same condition; the status line has to agree with it.
         if (!sessionId || sessionInterrupted(sessionId)) {
           return
         }
@@ -1083,39 +818,23 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           if (isActiveEvent) {
             setPetActivity({ toolRunning: false })
 
-            // A tool can fail without ending the turn when the agent recovers
-            // and continues. Surface that failure as a short pet beat too;
-            // otherwise only turn-level errors ever reach the failed state.
             if (payload?.error) {
               flashPetActivity({ error: true })
             }
           }
 
-          // A pending clarify blocks the turn, so the first tool.complete after
-          // one is the clarify resolving — drop the "needs input" flag here so
-          // the sidebar indicator clears as soon as it's answered, not only at
-          // message.complete.
           updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
 
-          // terminal/process tool calls are the only things that spawn or reap
-          // background processes — sync the composer status stack right after.
           if (!sessionInterrupted(sessionId) && (payload?.name === 'terminal' || payload?.name === 'process')) {
             void refreshBackgroundProcesses(sessionId)
           }
         }
 
-        // The agent just created/deleted/renamed a skill, which adds or removes
-        // its `/name` command. Drop the composer's cached `/` list so the new
-        // skill is offerable now rather than after the hour-long TTL — and the
-        // skill-suggestion provider's index with it.
         if (payload?.name === 'skill_manage') {
           invalidateSlashCompletions()
           invalidateSkillSuggestionIndex()
         }
 
-        // MCP tool outcomes feed the connection-repair suggestion provider:
-        // an auth/connection-shaped failure offers a reconnect pill; a later
-        // success against the same server withdraws it.
         if (sessionId && typeof payload?.name === 'string' && payload.name.startsWith('mcp__')) {
           reportMcpToolResult(
             sessionId,
@@ -1129,9 +848,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           recordToolDiff(payload.tool_id || payload.name || '', payload.inline_diff)
         }
 
-        // A file-mutating tool just finished — nudge the git-mirroring surfaces
-        // (coding rail, review pane, file tree) to refresh. Event-driven, not
-        // polled: fires exactly when the agent touches the tree.
         if (payload && toolMayMutateFiles(payload)) {
           notifyWorkspaceChanged(toolChangedPath(payload))
         }
@@ -1150,16 +866,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           )
         }
       } else if (event.type === 'clarify.request') {
-        // Surface the clarify tool's overlay. The Python side is blocked on
-        // `clarify.respond`, so without this handler the agent would hang
-        // forever (see tools/clarify_tool.py + tui_gateway/server.py:_block).
-        //
-        // Store the request for whichever session raised it — even a background
-        // one. clarify.request is a one-shot event; if we dropped it for an
-        // unfocused session, that session would block on `clarify.respond`
-        // indefinitely and re-focusing it could never recover (the event is
-        // gone). Parking it per-session lets the user answer once they switch
-        // over; the inline ClarifyTool reads the active session's entry.
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
         const question = typeof payload?.question === 'string' ? payload.question : ''
         const rawChoices = payload?.choices
@@ -1180,13 +886,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
 
           if (sessionId) {
-            // `clarify.request` is the blocking event the Python side waits on,
-            // while the inline UI normally mounts from the earlier `tool.start`
-            // row. If that row was missed (stream reconnect / hydration race) the
-            // sidebar still says "needs input" but there is nowhere to render the
-            // choices. Upsert a stable pending clarify tool row from the request
-            // itself so the prompt stays answerable; a real tool.start/complete
-            // with the same request id merges rather than duplicates.
             upsertToolCall(
               sessionId,
               {
@@ -1199,11 +898,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               occurredAt
             )
 
-            // The transcript only renders the active session, so a background
-            // clarify is otherwise invisible (the row just keeps spinning like
-            // it's working). Flag the session so the sidebar shows a persistent
-            // "needs input" indicator on its row — works for the active session
-            // too, and survives alt-tab / window blur (unlike a toast).
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
 
             if (sessionId === activeSessionIdRef.current) {
@@ -1219,11 +913,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'mcp.setup.request') {
-        // setup_mcp tool (desktop GUI): the agent proposed an MCP server and
-        // the Python side is blocked on mcp.setup.respond. Park the request
-        // per-session (like clarify) and upsert a stable pending tool row so
-        // the inline consent card has somewhere to render even when the
-        // tool.start event was missed (stream reconnect / hydration race).
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
         const server = typeof payload?.server === 'string' ? payload.server : ''
         const rawAction = typeof payload?.action === 'string' ? payload.action : 'install'
@@ -1250,17 +939,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'approval.request') {
-        // Dangerous-command / execute_code approval. The Python side is blocked
-        // in _await_gateway_decision() until approval.respond lands; without
-        // this the agent stalls until its 5-min timeout and the tool is BLOCKED.
-        // Park it per-session (like clarify) so a *background* profile's turn can
-        // raise it and wait — the sidebar flags "needs input" and the inline bar
-        // surfaces once the user focuses that chat.
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
 
         void receiveApprovalRequest($gateway.get(), {
-          // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
           choices: Array.isArray(payload?.choices)
             ? payload.choices.filter(choice => typeof choice === 'string')
@@ -1287,8 +969,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           title: translateNow('notifications.native.approvalTitle')
         })
       } else if (event.type === 'sudo.request') {
-        // Sudo password capture (tools/terminal_tool.py). Blocked on
-        // sudo.respond {request_id, password}.
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
@@ -1306,8 +986,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'secret.request') {
-        // Skill credential capture (tools/skills_tool.py). Blocked on
-        // secret.respond {request_id, value}.
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
@@ -1333,8 +1011,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'terminal.read.request') {
-        // read_terminal tool: serialize the renderer's xterm buffer and answer
-        // immediately (Python blocks on the respond). Empty text = no live pane.
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
@@ -1348,8 +1024,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'preview.read.request') {
-        // read_preview tool: serialize the active preview tab (a Browser
-        // webview's page text is async) and answer. Empty text = nothing open.
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
@@ -1364,9 +1038,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'window.read.request') {
-        // read_window_below tool: main owns native window enumeration, so ask
-        // it over IPC and answer. Empty text = unavailable (no bridge, or
-        // enumeration unsupported on this system e.g. Wayland).
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
@@ -1378,32 +1049,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               text: result ? JSON.stringify(result) : ''
             })
 
-          // .catch: ipcRenderer.invoke rejects on an older shell without the
-          // handler or a main-side throw — without an empty answer the tool
-          // would stall its full 30s timeout.
           void Promise.resolve(read ? read() : null).then(answer, () => answer(null))
         }
       } else if (event.type === 'agent.terminal.output') {
-        // Live chunk from a background process → its read-only agent terminal tab.
         writeAgentTerminalChunk(payload?.process_id ?? '', payload?.chunk ?? '')
       } else if (event.type === 'terminal.close') {
-        // Agent closed its own read-only tab via the desktop-gated close_terminal tool.
-        // The process is untouched — this only drops the view.
         closeAgentTerminalByProc(payload?.process_id ?? '')
       } else if (event.type === 'pane.reveal') {
-        // Agent revealed a pane via the desktop-gated focus_pane tool, in
-        // response to an explicit user request. Active session only — a
-        // background turn must never move the user's focus (desktop AGENTS.md:
-        // offer, don't hijack).
         if (isActiveEvent) {
           revealDesktopPane(payload?.pane ?? '')
         }
       } else if (event.type === 'message.reaction') {
-        // The agent reacted to a message via the desktop-gated
-        // react_to_message tool. Already persisted — this only paints it now
-        // instead of at the next resume. Fresh ChatMessage object per change:
-        // the runtime repository caches normalized ThreadMessages in a WeakMap
-        // keyed by ChatMessage identity.
         const reactedRowId = payload?.row_id
 
         if (typeof reactedRowId === 'number') {
@@ -1411,13 +1067,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const reactedRole = payload?.role === 'assistant' ? 'assistant' : 'user'
 
           setMessages(messages => {
-            // Preferred leg: the message already knows its durable row id
-            // (rehydrated transcript, or a live row that has round-tripped).
             const byRowId = messages.find(message => message.rowId === reactedRowId)
 
             if (byRowId) {
-              // Overlay survives the end-of-turn resume, which rebuilds from
-              // in-memory history that doesn't carry this mid-turn DB write.
               recordAgentReaction(reactedRowId, nextReactions)
 
               return messages.map(message =>
@@ -1425,11 +1077,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               )
             }
 
-            // Live leg: the targeted message is still optimistic (no rowId —
-            // it hasn't round-tripped through a resume). The agent's default
-            // target is the newest message of that role, so stamp the reaction
-            // AND the now-known row id onto it. Without this the event matches
-            // nothing and the reaction only appears after a reload.
             const lastIndex = messages.findLastIndex(
               message => message.role === reactedRole && message.rowId === undefined
             )
@@ -1453,26 +1100,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setSessionCompacting(sessionId, false)
           compactedTurnRef.current.delete(sessionId)
         } else if (sessionId && payload?.kind === 'process') {
-          // The gateway's notification poller announces background process
-          // completions / watch matches here — re-sync the status stack.
           void refreshBackgroundProcesses(sessionId)
         } else if (sessionId && payload?.kind === 'goal') {
           applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
         }
       } else if (event.type === 'review.summary') {
-        // Self-improvement background review saved something to memory/skills
-        // and emitted a persistent summary (Python formats it as
-        // "💾 Self-improvement review: …"). The CLI prints this via
-        // prompt_toolkit and the Ink TUI renders it as a system line; the
-        // desktop has neither, so without this handler the skill/memory
-        // change happens silently. Surface it as a persistent system message
-        // in the transcript so the user is always informed — it must not be a
-        // transient toast that can be missed.
-        //
-        // Typed here with the `review:` marker (same convention as `steer:` /
-        // `slash:`) so SystemMessage can paint it as the memory-write row it
-        // is instead of sniffing the backend's prose. The leading 💾 goes with
-        // it — the row draws its own glyph.
         const text = coerceGatewayText(payload?.text)
           .trim()
           .replace(/^[^\p{L}\p{N}]+/u, '')
@@ -1493,43 +1125,25 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }))
         }
       } else if (event.type === 'notification.show') {
-        // Driver-agnostic agent notice (credits usage/grant/depleted/restored
-        // from `agent/credits_tracker.py`). The Ink TUI renders these in its
-        // status bar; the desktop renders them as toasts. The notice key doubles
-        // as the toast id, so the escalating 50→75→90 credits line replaces in
-        // place instead of stacking. Account-wide signal — shown regardless of
-        // which session is focused.
         const notice = event.payload as AgentNoticePayload | undefined
 
         showAgentNotice(notice)
 
-        // The urgent pair (access paused / restored) also breaks through as a
-        // native OS notification when Hermes is backgrounded; dispatch is gated
-        // by the user's notification prefs + backgrounded check.
         const native = nativeNoticeInput(notice, translateNow('notifications.native.creditsTitle'))
 
         if (native) {
           dispatchNativeNotification(native)
         }
 
-        // A credits crossing moves the account balance. Settings → Billing polls
-        // `billing.state` every 30s; nudge it so the page reflects the crossing
-        // immediately instead of up to 30s late.
         if (notice?.key?.startsWith('credits.')) {
           void queryClient.invalidateQueries({ queryKey: ['billing', 'state'] })
         }
       } else if (event.type === 'notification.clear') {
-        // Key-matched dismissal (e.g. credits restored clears the depleted
-        // notice). notify() keys the toast by the notice key, so this maps
-        // straight to dismissNotification(key).
         clearAgentNotice((event.payload as AgentNoticePayload | undefined)?.key)
       } else if (event.type === 'error') {
         const errorMessage = payload?.message || 'Hermes reported an error'
         const looksLikeProviderSetup = isProviderSetupErrorMessage(errorMessage)
 
-        // A turn that errors out has also ended — drop any open blocking prompt
-        // for this session so an approval/sudo/secret overlay can't linger past
-        // the failed turn (same intent as the message.complete clear).
         if (sessionId) {
           clearAllPrompts(sessionId)
           clearClarifyRequest(undefined, sessionId)
@@ -1555,10 +1169,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         } else if (isDiskFullErrorMessage(errorMessage)) {
           notifyError(new Error(errorMessage), translateNow('notifications.errors.diskFull'))
         } else {
-          // Toast globally, not just when the failing thread is focused: a
-          // turn-ending error (e.g. out of funds) blocks every thread, so the
-          // inline error alone is too easy to miss. The stable id collapses the
-          // same error from multiple blocked threads into one toast.
           notify({
             id: `gateway-error:${errorMessage}`,
             kind: 'error',

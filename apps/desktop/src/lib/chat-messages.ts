@@ -83,67 +83,40 @@ export type GatewayEventPayload = {
   install_warning?: string
   personality?: string
   usage?: Partial<UsageStats>
-  // agent.terminal.output — live chunk for a read-only agent terminal tab
   process_id?: string
   chunk?: string
-  // clarify.request
   request_id?: string
   question?: string
   choices?: string[] | null
   multi_select?: boolean
-  // mcp.setup.request (setup_mcp tool — inline MCP consent card)
   server?: string
   action?: string
   reason?: string
-  // approval.request (dangerous command / execute_code) — session-keyed
   command?: string
   description?: string
-  // False when a tirith content-security warning forbids a permanent allow.
   allow_permanent?: boolean
   smart_denied?: boolean
-  // secret.request (skill credential capture)
   env_var?: string
   prompt?: string
-  // terminal.read.request / preview.read.request (GUI agent reading the
-  // in-app terminal pane or the browser/preview pane)
   start?: number
   count?: number
-  // status.update (kind=process → background process completion/watch-match)
   kind?: string
-  // pane.reveal (agent focusing a desktop pane via the focus_pane tool)
   pane?: string
-  // message.reaction (agent reacting via the react_to_message tool) — the
-  // durable messages.id, that row's full reaction list after the write, and
-  // the row's role so a live (not-yet-round-tripped) message can be matched.
   row_id?: number
   reactions?: MessageReaction[]
   role?: string
-  // session.title (live auto-title push) — stored session id + generated title
   session_id?: string
   title?: string
-  // session.info — the stored (durable) session id for this runtime session.
-  // Lets the desktop app map runtime→stored for background sessions it hasn't
-  // opened, so the sidebar working indicator updates without opening the chat.
   stored_session_id?: string
-  // moa.reference / moa.aggregating (Mixture of Agents per-model relay)
   label?: string
   index?: number
   aggregator?: string
-  // moa.progress / moa.phase (Mixture of Agents fan-out progress relay)
   refs_done?: number
   refs_total?: number
   phase?: string
-  // message.complete — signals the final text was already previewed via
-  // interim_assistant_callback, so the UI can settle instead of duplicating.
   response_previewed?: boolean
-  // message.complete with status "error" — `text` is streamed partial output
-  // (keep it visible), not the error string.
   partial?: boolean
-  // message.complete with status "error" — the failed turn was retained
-  // backend-side and will replay through session.resume's inflight payload.
   recoverable?: boolean
-  // Structured billing wall forwarded on message.complete when a turn fails
-  // with FailoverReason.billing (shape mirrors @hermes/shared BillingBlock).
   billing?: BillingBlock
   failure_reason?: string
 }
@@ -310,8 +283,6 @@ export function mergeFinalAssistantText(
       .join('')
   )
 
-  // An authoritative final that is exactly the concatenation of streamed text
-  // confirms the content without erasing text↔reasoning activity boundaries.
   if (streamedText && streamedText === dedupeReference) {
     return parts
   }
@@ -320,10 +291,6 @@ export function mergeFinalAssistantText(
 
   const kept = parts.filter(part => {
     if (part.type === 'text') {
-      // Sealed text parts were already finalized into their own bubbles —
-      // this filter only runs on the LAST streaming bubble, so there are no
-      // sealed parts here. All text parts are streamed deltas that get
-      // replaced by the authoritative final text.
       return false
     }
 
@@ -331,9 +298,6 @@ export function mergeFinalAssistantText(
       return true
     }
 
-    // Reasoning is a restatement only when the final FULLY covers it.
-    // The reverse direction is not considered — a short final must not
-    // swallow a longer reasoning block (#61447).
     const r = normalizeWs(part.text)
 
     return !(r && dedupeReference.startsWith(r))
@@ -399,9 +363,6 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
     return textContent
   }
 
-  // A `/skill` turn is stored expanded (the whole skill body). Current
-  // gateways project it to the invocation before it ever reaches us; this is
-  // the fallback for an older backend that still ships the raw payload.
   const invocation = skillInvocationText(textContent)
 
   if (invocation) {
@@ -418,9 +379,6 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   const attachedContext = textContent.slice(marker.index + marker[0].length)
   const refs = [...new Set(Array.from(attachedContext.matchAll(CONTEXT_REF_RE)).map(match => match[0]))]
 
-  // The prose keeps the `@file:` token the user typed, so it already chips in
-  // place. Only hoist a ref the prose is missing — a turn persisted by an older
-  // backend that stripped the tokens. Re-listing an inline ref would chip twice.
   const missing = refs.filter(ref => !visibleText.includes(ref))
 
   return [missing.join('\n'), visibleText].filter(Boolean).join('\n\n') || visibleText
@@ -430,8 +388,6 @@ function transcriptContent(displayKind: SessionMessage['display_kind'], content:
   return displayKind === 'hidden' ? null : content
 }
 
-// A remote backend older than this app serves display_metadata as raw JSON text,
-// and `in` throws on a primitive — which used to fail the whole session resume.
 function parseDisplayMetadata(metadata: SessionMessage['display_metadata']): null | Record<string, unknown> {
   let parsed: unknown = metadata
 
@@ -510,9 +466,6 @@ export function completeOpenTimelineParts(parts: ChatMessagePart[], completedAt:
   )
 }
 
-// Coalesce only adjacent deltas of the same channel. Switching between text
-// and reasoning is a real timeline boundary and must remain visible even when
-// both channels arrive inside one batched renderer flush.
 function appendStreamPart(
   parts: ChatMessagePart[],
   type: 'reasoning' | 'text',
@@ -615,11 +568,6 @@ function collectToolMatchValues(query: string, context: string, preview: string)
 
 function toolPayloadMatchValues(payload: GatewayEventPayload | undefined): string[] {
   const payloadArgs = liveToolArgs(payload)
-  // `question` is clarify's identifying arg: a synthetic row hydrated from
-  // `clarify.request` (a fresh request id) must correlate with the `tool.start`
-  // row (the model's tool_call_id) so the two ids don't produce a duplicate
-  // clarify card — same correlation ClarifyToolPending uses for request↔args.
-  // `server` is setup_mcp's identifying arg, for the identical reason.
   const query = firstStringField(payloadArgs, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path'])
   const context = typeof payload?.context === 'string' ? payload.context.trim() : ''
   const preview = typeof payload?.preview === 'string' ? payload.preview.trim() : ''
@@ -667,9 +615,6 @@ function findToolPartIndex(
       return stableIndex
     }
 
-    // Some live streams start without an id, then complete with one. Fall
-    // through to pending same-name/context matching so the completion updates
-    // the synthetic live row instead of appending a duplicate completed row.
     if (phase === 'running' && !matchValues.length) {
       return -1
     }
@@ -702,9 +647,6 @@ function findToolPartIndex(
     return singlePendingIndex
   }
 
-  // Completion events without stable IDs frequently arrive after multiple
-  // same-name starts (parallel tool calls). Resolve them oldest-first so we
-  // don't collapse an entire burst into a single row.
   if (phase === 'complete') {
     return pendingIndices[0]
   }
@@ -713,13 +655,9 @@ function findToolPartIndex(
     return pendingIndices[0]
   }
 
-  // For progress/running events with no stable id, update the most-recent
-  // pending same-name tool instead of creating a phantom extra row.
   return pendingIndices.at(-1) ?? -1
 }
 
-// Carry todo state across sparse progress payloads: if this todo event lacks
-// a `todos` field, fall back to whatever we previously stored on the part.
 function carryTodos(payload: GatewayEventPayload | undefined, ...prev: unknown[]): { todos: unknown } | undefined {
   if (payload && Object.hasOwn(payload, 'todos')) {
     const next = parseTodos(payload.todos)
@@ -782,8 +720,6 @@ export function upsertToolPart(
 ): ChatMessagePart[] {
   const stableId = toolId(payload)
   const name = payload?.name || 'tool'
-  // A completion can be the first tool event observed after reconnect, so it
-  // also constitutes a text/reasoning -> tool boundary when no start arrived.
   const next = completeOpenStreamParts(parts, occurredAt)
 
   const index = findToolPartIndex(next, name, stableId, payload, phase)
@@ -1025,10 +961,6 @@ function applyStoredToolResultToParts(parts: ChatMessagePart[], toolMessage: Ses
 function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex: number): ChatMessagePart {
   const name = toolMessage.tool_name || toolMessage.name || 'tool'
   const context = textFromUnknown(toolMessage.context || toolMessage.text || toolMessage.content || '')
-  // Prefer the full arguments when the gateway projection carries them:
-  // `context` is an 80-char display preview, and the expanded tool row
-  // rebuilds the real command from args. Keep `context` alongside as the
-  // title-side placeholder.
   const storedArgs = parseMaybeJsonObject(toolMessage.args)
   const args = { ...storedArgs, ...(context ? { context } : {}) }
 
@@ -1170,13 +1102,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         ? 'system'
         : message.role
 
-    // Persisted user turns carry `@image:<path>` directive lines inline in
-    // the text (see tui_gateway/server.py's persist-time rewrite). The
-    // read-only bubble clamps its body to ~2 lines, and a large inline image
-    // thumbnail pushes any caption text below the clamp's visible area — so
-    // pull image refs out into `attachmentRefs` (same shape the local
-    // optimistic composer already uses) and render them via the dedicated
-    // attachments row below the bubble instead.
     const imageRefExtraction = displayRole === 'user' && rawDisplayContent ? extractImageRefs(rawDisplayContent) : null
     const displayContent = imageRefExtraction ? imageRefExtraction.cleanedText : rawDisplayContent
     const extractedAttachmentRefs = imageRefExtraction?.refs.length ? imageRefExtraction.refs : undefined
@@ -1257,9 +1182,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const reactions = messageReactions(message.display_metadata)
-    // Gateway resume names the durable row id `row_id`; the REST transcript
-    // prefetch ships the same messages.id as a numeric `id`. Either one lets
-    // reactions address this exact row later.
     const rowId = message.row_id ?? (typeof message.id === 'number' ? message.id : undefined)
 
     result.push({

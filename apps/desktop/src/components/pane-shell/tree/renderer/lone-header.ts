@@ -19,8 +19,6 @@ export function forceLoneHeaderForPanes(
   chromeOf: (id: string) => LoneHeaderChrome,
   isCollapsePane: (id: string) => boolean
 ): boolean {
-  // "This pane can be closed, so it must expose the ✕." Only the uncloseable
-  // workspace is exempt; standing side chrome (files / sessions) isn't 'main'.
   if (
     shown.some(id => {
       const chrome = chromeOf(id)

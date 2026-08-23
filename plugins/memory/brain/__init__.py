@@ -17,9 +17,9 @@ Backend: /home/dietpi/clawd/brain/cli.py (Postgres + pgvector, per-bot database)
 Config in $HERMES_HOME/config.yaml (profile-scoped):
   plugins:
     hermes-brain:
-      brain_db: paul_brain              # per-bot graph database
-      cli_dir: /home/dietpi/clawd/brain # where cli.py + .venv live
-      auto_store: true                  # distil each turn into triples
+      brain_db: paul_brain
+      cli_dir: /home/dietpi/clawd/brain
+      auto_store: true
       extract_model: mistral/mistral-large-latest
       recall_limit: 8
 """
@@ -37,16 +37,6 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
-
-# --- Проверка происхождения точных величин ------------------------------------
-# Модель читает числа с фотографий и документов и ошибается: один и тот же чек она
-# подписывала тремя разными магазинами и валютами. Такая ошибка молча переприписывает
-# реальные суммы чужому месту и времени, и опровергнуть её потом нечем.
-#
-# Принцип: точная величина или идентификатор — цена, вес, номер документа, индекс —
-# попадает в долговременную память, только если её написал сам пользователь. Мелкие
-# счётные числа ("3 яйца") под правило не подпадают: это не заявка на идентичность,
-# и их модель берёт из смысла фразы, а не с картинки.
 
 _PRECISE_TOKEN = re.compile(r"\d+(?:[.,]\d+)?(?:[/-]\d+)*")
 
@@ -201,10 +191,9 @@ Assistant: {assistant}
 """
 
 
-
-_BREATH_TURNS = 10        # выдох по числу ходов
-_BREATH_SECONDS = 7200    # ...или по времени (2 часа)
-_PERIOD_CHARS = 20000     # верхний предел периода в символах (MiniMax-M3 держит)
+_BREATH_TURNS = 10
+_BREATH_SECONDS = 7200
+_PERIOD_CHARS = 20000
 
 _RECONCILE_PROMPT = """You reconcile newly-extracted memory facts against what is ALREADY stored.
 
@@ -295,10 +284,8 @@ def _split_monolithic(fact_text: str) -> List[str]:
     raw = [ln.strip(" -\u2022*\t\u00b7\u2014") for ln in fact_text.splitlines()]
     lines = [ln for ln in raw
              if len(ln) > 8 and re.search(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]", ln)]
-    # многострочный список/таблица (>=4 содержательных строк) — бьём всегда
     if len(lines) >= 4:
         return lines
-    # однострочная простыня-план по дням — только если длинная
     if len(fact_text) > 250:
         day_hits = len({m.lower() for m in _DAY_MARK.findall(fact_text)})
         if day_hits >= 3:
@@ -324,7 +311,6 @@ class BrainMemoryProvider(MemoryProvider):
         self._extract_model: str = _DEFAULT_EXTRACT_MODEL
         self._auto_store: bool = True
         self._recall_limit: int = 8
-        # prefetch cache (mirrors mem0: never block the turn on a slow backend)
         self._pf_lock = threading.Lock()
         self._pf_query: str = ""
         self._pf_result: str = ""
@@ -335,7 +321,6 @@ class BrainMemoryProvider(MemoryProvider):
         self._breath_lock = threading.Lock()
         self._breath_path: str = ""
 
-    # -- identity ------------------------------------------------------------
 
     @property
     def name(self) -> str:
@@ -352,7 +337,6 @@ class BrainMemoryProvider(MemoryProvider):
         self._python = os.path.join(self._cli_dir, ".venv", "bin", "python")
         self._cli = os.path.join(self._cli_dir, "cli.py")
 
-    # -- lifecycle -----------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
@@ -396,7 +380,6 @@ class BrainMemoryProvider(MemoryProvider):
             if t and t.is_alive():
                 t.join(timeout=2.0)
 
-    # -- subprocess helper ---------------------------------------------------
 
     def _run_cli(self, args: List[str], timeout: float) -> str:
         env = dict(os.environ)
@@ -415,7 +398,6 @@ class BrainMemoryProvider(MemoryProvider):
             logger.warning("brain cli '%s' failed: %s", args[0] if args else "?", e)
             return ""
 
-    # -- system prompt -------------------------------------------------------
 
     def system_prompt_block(self) -> str:
         return (
@@ -455,7 +437,6 @@ class BrainMemoryProvider(MemoryProvider):
             "database: store state as relations and update them."
         )
 
-    # -- auto-recall ---------------------------------------------------------
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         self._start_prefetch(query)
@@ -522,12 +503,8 @@ class BrainMemoryProvider(MemoryProvider):
                 break
         return "## Brain Graph\n" + "\n".join(lines) if lines else ""
 
-    # -- auto-store ----------------------------------------------------------
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # BREATHING: no longer distil every turn. Buffer the turn cheaply; the
-        # LLM consolidator runs periodically (breathe) over the whole period so
-        # memory keeps facts/data/relations, not a transcript of every turn.
         if not self._auto_store or not (user_content or assistant_content):
             return
         try:
@@ -562,7 +539,7 @@ class BrainMemoryProvider(MemoryProvider):
     def _breathe_async(self) -> None:
         with self._sync_lock:
             if self._sync_thread and self._sync_thread.is_alive():
-                return  # already breathing
+                return
             self._sync_thread = threading.Thread(
                 target=self.breathe, daemon=True, name="brain-breathe")
             self._sync_thread.start()
@@ -589,14 +566,12 @@ class BrainMemoryProvider(MemoryProvider):
             return
         period = "\n".join(
             f"User: {t.get('u','')}\nAssistant: {t.get('a','')}" for t in turns)[:_PERIOD_CHARS]
-        # источник истины при дыхании — весь период (реплики обеих сторон),
-        # т.к. консолидатор обобщает текст диалога, а не читает фото заново.
         user_words = " ".join((t.get("u","")+" "+t.get("a","")) for t in turns)
         try:
             triples = self._consolidate(period)
         except Exception as e:
             logger.warning("brain breathe: consolidation failed, keeping buffer: %s", e)
-            return  # leave buffer — retry on next trigger
+            return
         kept = []
         for t in triples:
             missing = unsupported_precise_values(t, user_words)
@@ -607,7 +582,6 @@ class BrainMemoryProvider(MemoryProvider):
             kept.append(t)
         self._store_with_reconcile(kept)
         logger.info("brain breathe: %d turn(s) -> %d fact(s)", len(turns), len(kept))
-        # success — clear only the turns we consumed (append-safe: rewrite remainder)
         with self._breath_lock:
             try:
                 with open(self._breath_path, encoding="utf-8") as fh:
@@ -637,7 +611,6 @@ class BrainMemoryProvider(MemoryProvider):
             text = r.json()["choices"][0]["message"]["content"]
         return self._parse_triples(text)
 
-    # -- reconcile (шаг 2) ---------------------------------------------------
 
     def _recall_candidates(self, query: str) -> List[tuple]:
         """Существующие факты, похожие на query: [(fact_id8, content), ...].
@@ -728,7 +701,6 @@ class BrainMemoryProvider(MemoryProvider):
             self._store_triple(t)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # Exhale whatever is buffered when the session closes.
         try:
             self.breathe()
         except Exception as e:
@@ -783,9 +755,6 @@ class BrainMemoryProvider(MemoryProvider):
         return out[:5]
 
     def _store_triple(self, t: Dict[str, str], confidence: str = "extracted") -> str:
-        # СТРАХОВКА: модель обязана раскладывать план/список на связи, но через раз
-        # сливает всё в один многодневный fact. Ловим монолит и бьём построчно/по-дням,
-        # чтобы recall по конкретному дню/пункту находил точную запись, а не блоб.
         parts = _split_monolithic(str(t.get("fact", "")))
         if parts:
             logger.info("brain: monolithic fact split into %d parts (subject=%r)",
@@ -803,7 +772,6 @@ class BrainMemoryProvider(MemoryProvider):
         return self._raw_store(t, confidence)
 
     def _raw_store(self, t: Dict[str, str], confidence: str = "extracted") -> str:
-        # страховка от самопетель: ребро "X -> X" знания не несёт
         if str(t.get("subject", "")).strip().lower() == str(t.get("object", "")).strip().lower():
             logger.debug("brain: skipped self-loop triple %r", t.get("subject"))
             return "skipped self-loop"
@@ -812,9 +780,6 @@ class BrainMemoryProvider(MemoryProvider):
              t["fact"], t["context"], "", confidence, "-y"],
             _STORE_TIMEOUT,
         )
-        # brain prints the near-duplicates it found before force-storing. Surface them:
-        # a "similar" fact with different numbers is usually an outdated statement the
-        # agent should delete, so make it visible instead of silently piling both up.
         if "SIMILAR FACTS FOUND" in out:
             logger.info("brain: possible contradiction while storing %r -> %s",
                         t["fact"][:80],
@@ -822,7 +787,6 @@ class BrainMemoryProvider(MemoryProvider):
                                    if ln.strip().startswith("["))[:300])
         return out
 
-    # -- tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [BRAIN_GRAPH_SCHEMA]
@@ -867,22 +831,6 @@ class BrainMemoryProvider(MemoryProvider):
                         "context": str(args.get("context", "")).strip() or "stated by the user",
                     }
                     return ok(self._store_triple(triple, confidence="stated"))
-                # СТРАХОВКА (guard-in-code): модель через раз зовёт store ПЛОСКО, как
-                # файловый memory-tool — кладёт факт в `content`/`fact`, ключ в `fact_id`,
-                # мета в `context`, а predicate/object не даёт. Раньше это отбивалось
-                # "Need subject/predicate/object" и факт утекал в MEMORY.md.
-                #
-                # НЕ зовём LLM здесь: синхронный декомпозер конкурировал с основным ходом
-                # на одном MiniMax и таймаутил 60с × ~10 store/ход. Пишем факт МГНОВЕННО и
-                # детерминированно (запись памяти не должна зависеть от флаки-эндпоинта).
-                # Осмысленные связи из того же разговора достраивает «дыхание» в фоне —
-                # ему LLM доступен вне критического пути.
-                #
-                # ВАЖНО: эта модель кладёт сам ФАКТ в `context` (как файловый memory-tool
-                # кладёт содержимое в `content`), а `fact_id` использует как ключ. Напр.
-                # {"context":"31.07 сніданок: 250 г гречки...","fact_id":"meal-1-..."}.
-                # Поэтому текст факта берём из ЛЮБОГО из fact/content/context (самый длинный),
-                # иначе получались заглушки "subject records item" без содержания.
                 free = max((str(args.get(k, "")).strip()
                             for k in ("fact", "content", "context")),
                            key=len, default="")
@@ -890,27 +838,19 @@ class BrainMemoryProvider(MemoryProvider):
                 if not (free or subj or fid):
                     return json.dumps({"error": "Need at least a 'subject'/'fact_id' "
                                        "or a 'fact'/'content'/'context' text"})
-                # если текста нет вовсе — хоть де-слагнутый ключ, чтобы факт был находим
                 if not free:
                     free = (fid or subj).replace("-", " ").replace("_", " ").strip()
                 subj = subj or _slugify(fid) or _slugify(free)
                 pred = pred or "records"
-                # object обязан отличаться от subject (self-loop пропускается): слаг факта,
-                # иначе слаг ключа.
                 obj = obj or _slugify(free) or _slugify(fid) or "note"
                 if obj == subj:
                     obj = _slugify(fid) if _slugify(fid) != subj else "note"
                 triple = {
                     "subject": subj, "predicate": pred, "object": obj,
                     "fact": free,
-                    # context факта = ключ модели (для трассировки), не дублируем текст
                     "context": fid or "stated by the user",
                 }
                 stored = self._store_triple(triple, confidence="stated")
-                # НЕ отдаём модели сырой CLI-вывод (`X → records → Y` + CHECKLIST):
-                # модель читает дефолтный predicate `records` как деградацию и пугает
-                # пользователя «технічним обмеженням API». Факт сохранён и ищется;
-                # осмысленную связь достраивает «дыхание» в фоне.
                 note = ("Saved — the fact text is stored and searchable now. Its exact "
                         "subject->predicate->object relation is linked up automatically "
                         "in the background; the default 'records' relation is expected "
@@ -947,7 +887,6 @@ class BrainMemoryProvider(MemoryProvider):
         except Exception as e:
             return json.dumps({"error": f"brain_graph failed: {e}"}, ensure_ascii=False)
 
-    # -- config surface ------------------------------------------------------
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [

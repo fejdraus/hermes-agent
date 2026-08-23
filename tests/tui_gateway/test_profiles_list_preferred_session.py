@@ -54,8 +54,6 @@ def _add_session(db, sid, *, source="cli", title="", ts, text, hidden=False,
     with db._lock:
         db._conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, sid))
         if end_reason:
-            # Mark ended AFTER appending: the DB (correctly) refuses writes
-            # to a compression-closed session.
             db._conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
                 (ts + 1, end_reason, sid),
@@ -73,11 +71,6 @@ def _row(profiles, name):
     return next(p for p in profiles if p["name"] == name)
 
 
-# ---------------------------------------------------------------------------
-# preferred_session resolution
-# ---------------------------------------------------------------------------
-
-
 def test_preferred_session_summarizes_pin_not_latest(home):
     db = _db(home)
     _add_session(db, "pinned1", title="Bot Chat", ts=1000, text="pinned chat content")
@@ -92,7 +85,6 @@ def test_preferred_session_summarizes_pin_not_latest(home):
     assert pref["resolved_id"] == "pinned1"
     assert pref["title"] == "Bot Chat"
     assert "pinned chat content" in pref["preview"]
-    # last_session keeps its own contract: the most recently active session.
     assert row["last_session"]["id"] == "other1"
 
 
@@ -106,11 +98,9 @@ def test_preferred_session_resolves_hidden_pin(home):
     rows = _profiles({"preferred_session_ids": {"default": "hiddenpin"}})
     row = _row(rows, "default")
 
-    # The pin is precise: hidden from listings must not mean "does not exist".
     assert row["preferred_session"] is not None
     assert row["preferred_session"]["id"] == "hiddenpin"
     assert "hidden bot chat content" in row["preferred_session"]["preview"]
-    # …while the generic latest-session listing still excludes hidden rows.
     assert row["last_session"]["id"] == "visible1"
 
 
@@ -135,8 +125,6 @@ def test_preferred_session_denied_internal_source_returns_none(home):
     rows = _profiles({"preferred_session_ids": {"default": "toolrun"}})
     row = _row(rows, "default")
 
-    # Internal sources (tool sub-agent runs, kanban workers) are not
-    # conversations — a pin pointing at one resolves as absent.
     assert row["preferred_session"] is None
 
 
@@ -153,15 +141,9 @@ def test_preferred_session_resolves_compression_tip(home):
     row = _row(rows, "default")
 
     pref = row["preferred_session"]
-    # The pin keeps its durable identity; the summary comes from the live tip.
     assert pref["id"] == "root1"
     assert pref["resolved_id"] == "tip1"
     assert "post-compression content" in pref["preview"]
-
-
-# ---------------------------------------------------------------------------
-# Contract guards
-# ---------------------------------------------------------------------------
 
 
 def test_no_param_omits_preferred_key(home):
@@ -189,8 +171,6 @@ def test_include_sessions_false_skips_preferred(home):
 
 
 def test_preferred_ids_scoped_per_profile_db(home):
-    # Same session id in BOTH profiles' state.db files, different content —
-    # each row must summarize its own profile's database.
     default_db = _db(home)
     _add_session(default_db, "shared1", title="Default Bot", ts=1000,
                  text="default profile content")

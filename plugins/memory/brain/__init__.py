@@ -663,7 +663,7 @@ class BrainMemoryProvider(MemoryProvider):
                             op, product, mv.get("qty"))
                 continue
             unit = str(mv.get("unit") or "").strip()
-            args = [op, product, str(qty)] + ([unit] if unit else [])
+            args = [op, product, str(qty)] + ([unit] if unit else []) + ["--once"]
             ok, out = self._run_inventory(args)
             logger.info("brain ledger: %s %s %s -> %s", op, product, qty,
                         "ok" if ok else out[:160])

@@ -275,6 +275,36 @@ Return ONLY a JSON array, one object per new fact:
 [{"i": <index>, "action": "skip|update|add", "id": "<existing id if update, else empty>"}]"""
 
 
+_LEDGER_PROMPT = """You read a period of conversation and pull out what the FOOD LEDGER
+must record. The ledger is a physical inventory: what was eaten, bought, or thrown away,
+and recipes worth keeping.
+
+Return ONLY a JSON object, no prose:
+{"moves": [{"op": "use|bought|spoil", "product": "...", "qty": <number>, "unit": "г|мл|шт",
+            "quote": "the exact sentence from the conversation that states it"}],
+ "recipes": [{"name": "...", "ingredients": [{"product": "...", "qty": <number>}],
+              "servings": <number>, "instructions": "1. ... 2. ...", "source": "..."}]}
+
+MOVES — record ONLY what already happened:
+- "use" — eaten or cooked; "bought" — brought home (a receipt line); "spoil" — thrown away.
+- The user must have STATED it. Intent, plans, suggestions, menus for tomorrow, and
+  questions ("what should I cook?", "I'll have chicken later") are NOT moves.
+- The quantity must be stated in the conversation. Never estimate a portion yourself,
+  never convert "a plate" or "a bit" into grams. No quantity in the text → no move.
+- "quote" MUST be copied verbatim from the conversation. It is checked; an invented
+  quote silently drops the move.
+- Product names stay as the user said them, in their language.
+
+RECIPES — a dish with an ingredient list worth cooking again, whether the user dictated
+it or it was found online. Include the method in "instructions" if it was given. Skip a
+dish mentioned only in passing with no ingredients.
+
+Empty arrays when there is nothing. Never fill the ledger to look useful.
+
+CONVERSATION:
+{period}"""
+
+
 _CONSOLIDATE_PROMPT = """You consolidate a PERIOD of conversation into long-term graph memory.
 
 Return ONLY a JSON array. Each item:
@@ -567,6 +597,117 @@ class BrainMemoryProvider(MemoryProvider):
         blocks = [b for b in (self._pantry_block(), recalled) if b]
         return "\n\n".join(blocks)
 
+    def _inventory_script(self) -> str:
+        path = os.path.join(
+            os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
+            "scripts", "inventory.py")
+        return path if os.path.exists(path) and self._python else ""
+
+    def _run_inventory(self, args: List[str]) -> tuple:
+        script = self._inventory_script()
+        if not script:
+            return False, "no ledger"
+        try:
+            proc = subprocess.run([self._python, script, *args],
+                                  capture_output=True, text=True, timeout=40.0)
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            return proc.returncode == 0, out
+        except Exception as e:
+            return False, str(e)
+
+    def _apply_ledger(self, period: str) -> None:
+        """Записать в учёт то, что уже произошло в разговоре.
+
+        Списание, отложенное до того, как о нём вспомнят, не происходит: за
+        месяц на 198 движений пришлось 1554 продукта, и остаток расходился с
+        полкой. Здесь ход разбирается сразу после того, как состоялся.
+
+        Код не доверяет извлечению на слово. Движение проходит, только если
+        названное количество и подтверждающая цитата действительно есть в
+        разговоре — выдуманная цитата отбрасывает запись целиком. Само
+        применение идёт через CLI, поэтому неизвестный продукт отвергается
+        учётом, а не заводится молча из оговорки.
+
+        Рецепт с неоднозначным ингредиентом (`сир` при живом `сир твердий`)
+        сюда не проходит: автомат, разводящий одну позицию на две, ломает
+        учёт сильнее, чем потерянная запись, которую можно внести руками.
+        """
+        if not self._inventory_script():
+            return
+        try:
+            data = self._extract_ledger(period)
+        except Exception as e:
+            logger.warning("brain ledger extract failed: %s", e)
+            return
+        haystack = period.lower()
+        digits = {_digit_key(m) for m in _PRECISE_TOKEN.findall(period)}
+        for mv in data.get("moves") or []:
+            op = str(mv.get("op", "")).strip().lower()
+            product = str(mv.get("product", "")).strip()
+            quote = str(mv.get("quote", "")).strip().lower()
+            if op not in ("use", "bought", "spoil") or not product:
+                continue
+            try:
+                qty = float(str(mv.get("qty")).replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            if not quote or quote[:60] not in haystack:
+                logger.info("brain ledger: dropped %s %r — quote not in conversation",
+                            op, product)
+                continue
+            key = _digit_key(str(mv.get("qty")))
+            if key and key not in digits and not any(key in d for d in digits):
+                logger.info("brain ledger: dropped %s %r — quantity %s never stated",
+                            op, product, mv.get("qty"))
+                continue
+            unit = str(mv.get("unit") or "").strip()
+            args = [op, product, str(qty)] + ([unit] if unit else [])
+            ok, out = self._run_inventory(args)
+            logger.info("brain ledger: %s %s %s -> %s", op, product, qty,
+                        "ok" if ok else out[:160])
+        for rec in data.get("recipes") or []:
+            name = str(rec.get("name", "")).strip()
+            ings = rec.get("ingredients") or []
+            if not name or not ings:
+                continue
+            pairs = []
+            for ing in ings:
+                pname = str(ing.get("product", "")).strip()
+                try:
+                    q = float(str(ing.get("qty")).replace(",", "."))
+                except (TypeError, ValueError):
+                    continue
+                if pname and q > 0:
+                    pairs.append(f"{pname}={q:g}")
+            if not pairs:
+                continue
+            args = ["recipe-add", name, *pairs]
+            for field, flag in (("servings", "--servings"), ("instructions", "--instructions"),
+                                ("source", "--source")):
+                val = str(rec.get(field) or "").strip()
+                if val:
+                    args += [flag, val]
+            ok, out = self._run_inventory(args)
+            logger.info("brain ledger: recipe %r -> %s", name, "ok" if ok else out[:160])
+
+    def _extract_ledger(self, period: str) -> Dict[str, Any]:
+        import httpx
+        payload = {
+            "model": self._extract_model,
+            "messages": [{"role": "user",
+                          "content": _LEDGER_PROMPT.replace("{period}", period)}],
+            "temperature": 0,
+        }
+        with httpx.Client(timeout=_EXTRACT_TIMEOUT) as client:
+            r = client.post(self._llm_base_url + "/chat/completions", json=payload,
+                            headers={"Authorization": f"Bearer {self._llm_api_key}"})
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
+        m = re.search(r"\{.*\}", text, re.S)
+        return json.loads(m.group(0)) if m else {}
+
     def _pantry_block(self) -> str:
         """Свежая сводка учёта, вложенная в контекст хода.
 
@@ -705,6 +846,12 @@ class BrainMemoryProvider(MemoryProvider):
             kept.append(t)
         self._store_with_reconcile(kept)
         logger.info("brain breathe: %d turn(s) -> %d fact(s)", len(turns), len(kept))
+        try:
+            self._apply_ledger(period)
+        except Exception as e:
+            logger.warning("brain ledger pass failed: %s", e)
+        finally:
+            self._pantry_at = 0.0
         with self._breath_lock:
             try:
                 with open(self._breath_path, encoding="utf-8") as fh:

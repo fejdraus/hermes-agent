@@ -217,3 +217,4 @@ native/fts5_cjk/*.so
 CLAUDE.md
 mcp-cursor-executed.txt
 tinker-atropos/
+.skills_prompt_snapshot.json

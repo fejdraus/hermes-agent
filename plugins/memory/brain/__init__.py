@@ -65,6 +65,56 @@ def unsupported_precise_values(triple: Dict[str, str], user_text: str) -> List[s
             missing.append(token)
     return missing
 
+
+_MEASURE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:г|гр|грам\w*|кг|мл|л|шт|штук\w*|ккал|кал|"
+    r"ложк\w*|склянк\w*|пачк\w*|банк\w*|упак\w*|порці\w*|порци\w*)\b",
+    re.IGNORECASE,
+)
+_PRESCRIPTIVE = re.compile(
+    r"норм\w*|ціл\w*|цел[ьия]\w*|мінімум|минимум|максимум|не більш\w*|не менш\w*|"
+    r"не бол\w*|не мен\w*|ліміт\w*|лимит\w*|треба|потрібн\w*|нужно|має бути|"
+    r"повин\w*|должн\w*|щодня|щоденн\w*|кажд\w+ день|на день|правил\w*|"
+    r"дозвол\w*|разреш\w*|заборон\w*|запрещ\w*",
+    re.IGNORECASE,
+)
+_WORD = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+_TRAILING_VOWELS = re.compile(r"[аеєиіїоуюяьыэё]+$", re.IGNORECASE)
+
+
+def _stem(word: str) -> str:
+    """Грубая основа слова: хвостовые гласные отбрасываются, чтобы «яйця» и
+    «яйце» сошлись в один ключ. Морфологии здесь не нужно — сверка идёт со
+    справочником, а не со свободным текстом."""
+    return _TRAILING_VOWELS.sub("", word[:6].lower())
+
+
+def stems(text: str) -> set:
+    return {s for s in (_stem(w) for w in _WORD.findall(text or "")) if len(s) >= 3}
+
+
+def ledger_owned(triple: Dict[str, str], ledger_stems: set) -> bool:
+    """Тройка описывает измеренное состояние того, за что отвечает система учёта.
+
+    Принцип: у величины, которую можно получить запросом к учётной системе, уже
+    есть владелец — граф хранит правила, предпочтения и события, а не показания
+    счётчика. Две копии одного числа неизбежно расходятся, и та, что лежит ближе
+    к контексту, побеждает правильную. Признак — величина с единицей количества
+    рядом с предметом, который ведётся в учёте.
+
+    Гейт закрыт только для показаний. Предписание — норма, цель, лимит, запрет —
+    говорит о том, сколько должно быть, а не сколько есть; у него нет строки в
+    учёте, и оно остаётся правилом в графе."""
+    if not ledger_stems:
+        return False
+    claimed = " ".join(str(triple.get(k, "")) for k in ("subject", "predicate", "object", "fact"))
+    if not _MEASURE.search(claimed):
+        return False
+    if _PRESCRIPTIVE.search(claimed):
+        return False
+    return bool(stems(claimed) & ledger_stems)
+
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CLI_DIR = "/home/dietpi/clawd/brain"
@@ -74,6 +124,7 @@ _RECALL_TIMEOUT = 20.0
 _STORE_TIMEOUT = 30.0
 _EXTRACT_TIMEOUT = 60.0
 _PREFETCH_WAIT = 6.0
+_LEDGER_TTL = 600.0
 
 BRAIN_GRAPH_SCHEMA: Dict[str, Any] = {
     "name": "brain_graph",
@@ -320,6 +371,8 @@ class BrainMemoryProvider(MemoryProvider):
         self._sync_lock = threading.Lock()
         self._breath_lock = threading.Lock()
         self._breath_path: str = ""
+        self._ledger_cache: set = set()
+        self._ledger_at: float = 0.0
 
 
     @property
@@ -398,6 +451,34 @@ class BrainMemoryProvider(MemoryProvider):
             logger.warning("brain cli '%s' failed: %s", args[0] if args else "?", e)
             return ""
 
+    def _ledger_stems(self) -> set:
+        """Основы названий всего, что ведётся в учётной системе той же базы.
+
+        Список не задан в коде: он читается из справочника и растёт вместе с
+        ним, поэтому гейт не надо править при каждом новом продукте. Базы без
+        схемы учёта просто получают пустое множество и гейт не срабатывает."""
+        now = time.time()
+        if self._ledger_at and now - self._ledger_at < _LEDGER_TTL:
+            return self._ledger_cache
+        sql = ("select name from ops.product union select alias from ops.product_alias")
+        env = dict(os.environ)
+        env["PGPASSWORD"] = os.environ.get("BRAIN_DB_PASS", "thufir_secret")
+        cmd = ["psql", "-h", os.environ.get("BRAIN_DB_HOST", "127.0.0.1"),
+               "-p", os.environ.get("BRAIN_DB_PORT", "5433"),
+               "-U", os.environ.get("BRAIN_DB_USER", "postgres"),
+               "-d", self._db, "-tAc", sql]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15.0, env=env)
+            names = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        except Exception as e:
+            logger.debug("brain ledger stems unavailable: %s", e)
+            names = []
+        self._ledger_cache = stems(" ".join(names))
+        self._ledger_at = now
+        if names:
+            logger.info("brain ledger guard: %d name(s) -> %d stem(s)",
+                        len(names), len(self._ledger_cache))
+        return self._ledger_cache
 
     def system_prompt_block(self) -> str:
         return (
@@ -573,11 +654,16 @@ class BrainMemoryProvider(MemoryProvider):
             logger.warning("brain breathe: consolidation failed, keeping buffer: %s", e)
             return
         kept = []
+        ledger = self._ledger_stems()
         for t in triples:
             missing = unsupported_precise_values(t, user_words)
             if missing:
                 logger.info("brain breathe: dropped %r — invented numbers %s",
                             t.get("subject"), missing)
+                continue
+            if ledger_owned(t, ledger):
+                logger.info("brain breathe: dropped %r — measured value owned by the ledger",
+                            t.get("subject"))
                 continue
             kept.append(t)
         self._store_with_reconcile(kept)

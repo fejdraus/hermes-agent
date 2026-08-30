@@ -125,6 +125,7 @@ _STORE_TIMEOUT = 30.0
 _EXTRACT_TIMEOUT = 60.0
 _PREFETCH_WAIT = 6.0
 _LEDGER_TTL = 600.0
+_PANTRY_TTL = 300.0
 
 BRAIN_GRAPH_SCHEMA: Dict[str, Any] = {
     "name": "brain_graph",
@@ -373,6 +374,8 @@ class BrainMemoryProvider(MemoryProvider):
         self._breath_path: str = ""
         self._ledger_cache: set = set()
         self._ledger_at: float = 0.0
+        self._pantry_cache: str = ""
+        self._pantry_at: float = 0.0
 
 
     @property
@@ -553,16 +556,50 @@ class BrainMemoryProvider(MemoryProvider):
             return out
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        cached = self._consume_prefetch(query)
-        if cached is not None:
-            return cached
-        self._start_prefetch(query)
-        with self._pf_lock:
-            thread = self._pf_thread if self._pf_query == query else None
-        if thread:
-            thread.join(timeout=_PREFETCH_WAIT)
-        cached = self._consume_prefetch(query)
-        return cached if cached is not None else ""
+        recalled = self._consume_prefetch(query)
+        if recalled is None:
+            self._start_prefetch(query)
+            with self._pf_lock:
+                thread = self._pf_thread if self._pf_query == query else None
+            if thread:
+                thread.join(timeout=_PREFETCH_WAIT)
+            recalled = self._consume_prefetch(query) or ""
+        blocks = [b for b in (self._pantry_block(), recalled) if b]
+        return "\n\n".join(blocks)
+
+    def _pantry_block(self) -> str:
+        """Свежая сводка учёта, вложенная в контекст хода.
+
+        Инструмент, который надо решить вызвать, не вызывается: за месяц логов
+        на 67 обращений к графу пришлось 9 к инвентарю, и ответы про остатки
+        собирались из припомненного. Поэтому актуальные числа кладутся в ход
+        безусловно — модели не нужно за ними тянуться, а расхождение между
+        сказанным и учтённым становится видно сразу.
+
+        Профили без учётного скрипта блок не получают."""
+        script = os.path.join(
+            os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
+            "scripts", "inventory.py")
+        if not os.path.exists(script) or not self._python:
+            return ""
+        now = time.time()
+        if self._pantry_at and now - self._pantry_at < _PANTRY_TTL:
+            return self._pantry_cache
+        try:
+            proc = subprocess.run([self._python, script, "brief"],
+                                  capture_output=True, text=True, timeout=25.0)
+            body = (proc.stdout or "").strip()
+        except Exception as e:
+            logger.warning("brain pantry brief failed: %s", e)
+            body = ""
+        self._pantry_cache = (
+            "## Pantry (ops.*, зараз)\n" + body +
+            "\n\nЦе єдине джерело залишків: числа звідси, не з пам'яті й не з графа. "
+            "Будь-яка зміна — командою inventory.py (use/bought/spoil/set), інакше "
+            "наступна відповідь буде хибною."
+        ) if body else ""
+        self._pantry_at = now
+        return self._pantry_cache
 
     def _recall_block(self, query: str) -> str:
         raw = self._run_cli(["recall", query], _RECALL_TIMEOUT)

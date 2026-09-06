@@ -115,6 +115,51 @@ def ledger_owned(triple: Dict[str, str], ledger_stems: set) -> bool:
     return bool(stems(claimed) & ledger_stems)
 
 
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _scan_json(text: str, array: bool) -> Any:
+    """Первое значение нужного вида, разобранное честным декодером."""
+    decoder = json.JSONDecoder()
+    opener = "[" if array else "{"
+    kind = list if array else dict
+    pos = text.find(opener)
+    while pos >= 0:
+        try:
+            value, _ = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            pos = text.find(opener, pos + 1)
+            continue
+        if isinstance(value, kind):
+            return value
+        pos = text.find(opener, pos + 1)
+    return None
+
+
+def json_from_reply(text: str, *, array: bool = False) -> Any:
+    """Разобрать ответ модели, что бы она вокруг JSON ни написала.
+
+    Жадное «от первой скобки до последней» ломается о рассуждения: внутри них
+    свои скобки, и захваченный кусок либо не разбирается, либо приносит
+    черновик вместо ответа. Здесь каждая скобка проверяется декодером, а
+    рассуждения отбрасываются раньше ответа — но только как первая попытка.
+
+    Вторая попытка идёт по всему тексту: M3 ставит </think> где придётся и
+    разрезает JSON пополам, оставляя `{"` внутри блока. Вырезание блока уносит
+    открывающую скобку, и валидный ответ пропадает вместе с ней.
+    """
+    raw = (text or "").strip()
+    stripped = _THINK_BLOCK.sub("", raw).strip()
+    if "<think>" in stripped:
+        stripped = stripped.split("<think>", 1)[0].strip() or stripped
+    stripped = re.sub(r"^```(?:json)?|```$", "", stripped, flags=re.MULTILINE).strip()
+    for candidate in (stripped, raw):
+        found = _scan_json(candidate, array)
+        if found is not None:
+            return found
+    return [] if array else {}
+
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CLI_DIR = "/home/dietpi/clawd/brain"
@@ -692,21 +737,34 @@ class BrainMemoryProvider(MemoryProvider):
             ok, out = self._run_inventory(args)
             logger.info("brain ledger: recipe %r -> %s", name, "ok" if ok else out[:160])
 
-    def _extract_ledger(self, period: str) -> Dict[str, Any]:
-        import httpx
-        payload = {
+    def _llm_payload(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Тело запроса к модели извлечения.
+
+        MiniMax по умолчанию рассуждает вслух и норовит поставить закрывающий
+        тег посреди JSON. Разбор от этого защищён, но дешевле не создавать
+        проблему: на этом провайдере рассуждения выключаются, у остальных
+        параметр не отправляется, чтобы не получить отказ на незнакомое поле.
+        """
+        payload: Dict[str, Any] = {
             "model": self._extract_model,
-            "messages": [{"role": "user",
-                          "content": _LEDGER_PROMPT.replace("{period}", period)}],
+            "messages": messages,
             "temperature": 0,
         }
+        if "minimax" in (self._llm_base_url or "").lower():
+            payload["thinking"] = {"type": "disabled"}
+        return payload
+
+    def _extract_ledger(self, period: str) -> Dict[str, Any]:
+        import httpx
+        payload = self._llm_payload([
+            {"role": "user", "content": _LEDGER_PROMPT.replace("{period}", period)},
+        ])
         with httpx.Client(timeout=_EXTRACT_TIMEOUT) as client:
             r = client.post(self._llm_base_url + "/chat/completions", json=payload,
                             headers={"Authorization": f"Bearer {self._llm_api_key}"})
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"]
-        m = re.search(r"\{.*\}", text, re.S)
-        return json.loads(m.group(0)) if m else {}
+        return json_from_reply(text)
 
     def _pantry_block(self) -> str:
         """Свежая сводка учёта, вложенная в контекст хода.
@@ -865,12 +923,8 @@ class BrainMemoryProvider(MemoryProvider):
     def _consolidate(self, period: str) -> List[Dict[str, str]]:
         import httpx
         prompt = _CONSOLIDATE_PROMPT.replace("{period}", period)
-        payload = {
-            "model": self._extract_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "stream": False,
-        }
+        payload = self._llm_payload([{"role": "user", "content": prompt}])
+        payload["stream"] = False
         with httpx.Client(timeout=_EXTRACT_TIMEOUT) as client:
             r = client.post(
                 self._llm_base_url.rstrip("/") + "/chat/completions",
@@ -899,12 +953,8 @@ class BrainMemoryProvider(MemoryProvider):
     def _reconcile_llm(self, existing_text: str, new_text: str) -> List[Dict[str, Any]]:
         import httpx
         prompt = _RECONCILE_PROMPT.replace("{existing}", existing_text).replace("{new}", new_text)
-        payload = {
-            "model": self._extract_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "stream": False,
-        }
+        payload = self._llm_payload([{"role": "user", "content": prompt}])
+        payload["stream"] = False
         with httpx.Client(timeout=_EXTRACT_TIMEOUT) as client:
             r = client.post(
                 self._llm_base_url.rstrip("/") + "/chat/completions",
@@ -913,14 +963,7 @@ class BrainMemoryProvider(MemoryProvider):
             )
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"]
-        cleaned = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.MULTILINE).strip()
-        m = re.search(r"\[.*\]", cleaned, re.DOTALL)
-        if not m:
-            return []
-        try:
-            data = json.loads(m.group(0))
-        except Exception:
-            return []
+        data = json_from_reply(text, array=True)
         return [d for d in data if isinstance(d, dict)]
 
     def _store_with_reconcile(self, triples: List[Dict[str, str]]) -> None:
@@ -981,12 +1024,8 @@ class BrainMemoryProvider(MemoryProvider):
 
         prompt = _EXTRACT_PROMPT.replace("{user}", user[:4000]).replace(
             "{assistant}", assistant[:4000])
-        payload = {
-            "model": self._extract_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "stream": False,
-        }
+        payload = self._llm_payload([{"role": "user", "content": prompt}])
+        payload["stream"] = False
         with httpx.Client(timeout=_EXTRACT_TIMEOUT) as client:
             r = client.post(
                 self._llm_base_url.rstrip("/") + "/chat/completions",
@@ -1001,14 +1040,7 @@ class BrainMemoryProvider(MemoryProvider):
     def _parse_triples(text: str) -> List[Dict[str, str]]:
         if not text:
             return []
-        cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-        match = re.search(r"\[.*\]", cleaned, re.DOTALL)
-        if not match:
-            return []
-        try:
-            data = json.loads(match.group(0))
-        except Exception:
-            return []
+        data = json_from_reply(text, array=True)
         out: List[Dict[str, str]] = []
         for item in data if isinstance(data, list) else []:
             if not isinstance(item, dict):

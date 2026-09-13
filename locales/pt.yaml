@@ -107,6 +107,7 @@ gateway:
     aborted:               "⚠️ Compressão abortada ({error}). Nenhuma mensagem foi removida — a conversa está inalterada. Executa /compress para tentar de novo, /reset para uma sessão nova, ou verifica a configuração do modelo auxiliary.compression."
     aux_failed:            "ℹ️ O modelo de compressão configurado `{model}` falhou ({error}). Recuperado com o teu modelo principal — o contexto está intacto — mas talvez queiras verificar `auxiliary.compression.model` em config.yaml."
     turnhold_deferred:     "ℹ️ Compressão de contexto adiada — o resumo ainda está em transmissão. Continuando sem compressão neste turno."
+    turnhold_adopted:     "✅ Compressão de contexto concluída — o resumo já está em vigor."
     failed:                "Compressão falhou: {error}"
 
   debug:

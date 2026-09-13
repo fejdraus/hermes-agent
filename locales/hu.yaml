@@ -107,6 +107,7 @@ gateway:
     aborted:               "⚠️ Tömörítés megszakítva ({error}). Egyetlen üzenet sem lett eldobva — a beszélgetés változatlan. Futtass /compress parancsot az újrapróbálkozáshoz, /reset egy új munkamenethez, vagy ellenőrizd az auxiliary.compression modell konfigurációt."
     aux_failed:            "ℹ️ A beállított tömörítőmodell (`{model}`) hibát adott ({error}). A főmodellel helyreállítva — a kontextus érintetlen — de érdemes ellenőrizni az `auxiliary.compression.model` beállítást a config.yaml fájlban."
     turnhold_deferred:     "ℹ️ A kontextustömörítés elhalasztva — az összefoglaló még streamel. Ebben a körben tömörítés nélkül folytatjuk."
+    turnhold_adopted:     "✅ A kontextustömörítés befejeződött — az összefoglaló mostantól érvényes."
     failed:                "Tömörítés sikertelen: {error}"
 
   debug:

@@ -107,6 +107,7 @@ gateway:
     aborted:               "⚠️ Kompressie gestaak ({error}). Geen boodskappe is laat val nie — die gesprek is onveranderd. Voer /compress uit om weer te probeer, /reset vir 'n skoon sessie, of kyk na jou auxiliary.compression-modelkonfigurasie."
     aux_failed:            "ℹ️ Opgestelde saamperseringsmodel `{model}` het misluk ({error}). Herstel met jou hoofmodel — konteks is intakt — maar jy mag dalk `auxiliary.compression.model` in config.yaml wil nagaan."
     turnhold_deferred:     "ℹ️ Kontekskompressie uitgestel — opsomming stroom nog. Gaan hierdie beurt sonder kompressie voort."
+    turnhold_adopted:     "✅ Kontekskompressie voltooi — die opsomming is nou van krag."
     failed:                "Saampersing het misluk: {error}"
 
   debug:

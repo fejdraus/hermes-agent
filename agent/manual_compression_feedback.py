@@ -18,7 +18,8 @@ def describe_compression_lock_skip(lock_signal: Any) -> str:
     if isinstance(lock_signal, str) and lock_signal.strip():
         return (
             f"⏳ Compression already in progress for this session "
-            f"(holder: {lock_signal}). Please wait for it to finish."
+            f"(holder: {lock_signal}). It commits on its own when the summary is ready — "
+            f"run /compress again afterwards if you want a second pass."
         )
     return (
         "⏳ Compression skipped: could not acquire this session's compression lock. Another compression may "

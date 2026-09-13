@@ -814,6 +814,8 @@ class GatewayTurnMixin:
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
+            _loop = asyncio.get_running_loop()
+            _notify_meta, _notify_source = attempt.meta, source
 
             def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
                 try:
@@ -835,6 +837,11 @@ class GatewayTurnMixin:
                         _reset_hygiene_failure_streak(_gw, _skey)
                     except Exception as _rs_err:
                         logger.debug("hygiene streak reset after deferred adoption failed: %s", _rs_err)
+                    with suppress(Exception):
+                        _loop.create_task(_gw._hmwa_hygiene_notify(
+                            _notify_source, _notify_meta, t("gateway.compress.turnhold_adopted"),
+                            "compression-turnhold adoption notice",
+                        ))
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.

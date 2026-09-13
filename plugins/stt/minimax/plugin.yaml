@@ -1,0 +1,4 @@
+name: stt-minimax
+version: 0.1.0
+description: MiniMax speech-to-text (asr-1.0) as an stt.provider backend
+author: fejdraus

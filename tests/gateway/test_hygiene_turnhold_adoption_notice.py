@@ -37,7 +37,8 @@ def test_notice_is_sent_only_on_the_committed_branch():
     assert source.count('t("gateway.compress.turnhold_adopted")') == 1
     callback = source[source.index("def _hyg_adopt_or_space_retry"):]
     callback = callback[:callback.index("attempt.future.add_done_callback")]
-    committed, _, not_committed = callback.partition("                else:")
+    branch = callback[callback.index("                if _committed:"):]
+    committed, _, not_committed = branch.partition("                else:")
     assert "turnhold_adopted" in committed
     assert "turnhold_adopted" not in not_committed
 

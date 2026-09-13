@@ -25,6 +25,7 @@ from gateway.session import (
     SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -33,6 +34,8 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+_MAX_TEXT_IMAGE_REFS = 4
 
 
 class GatewayInboundMixin:
@@ -1365,6 +1368,57 @@ class GatewayInboundMixin:
                 video_paths.append(path)
         return image_paths, audio_paths, audio_file_paths, video_paths
 
+    @staticmethod
+    def _merge_text_image_refs(message_text: str, image_paths: list) -> list:
+        """Local image paths named in the message text join the attachment list.
+
+        An attachment is pre-analyzed by the vision route before the model ever sees the
+        turn; a path typed into the text is not, so the model is free to answer from
+        imagination — and a text-only main model does exactly that. Routing both through
+        the same list closes that gap without asking the model to choose correctly.
+
+        Scope matches the ``@`` reference expander: existing regular files under the
+        session root only. Remote URLs are left alone (fetching one would be an outbound
+        request the user never asked for), and the cap keeps a path-like wall of text from
+        turning into an unbounded vision fan-out.
+        """
+        if not message_text:
+            return image_paths
+        try:
+            from agent.image_routing import extract_image_refs
+
+            try:
+                from tools.terminal_scope import terminal_env as _ts_env
+            except ImportError:
+                _ts_env = os.environ.get
+            allowed_root = Path(_ts_env("TERMINAL_CWD", os.path.expanduser("~"))).resolve()
+            referenced, _urls = extract_image_refs(message_text)
+            known = {str(p) for p in image_paths}
+            merged = list(image_paths)
+            for ref in referenced:
+                if len(merged) - len(image_paths) >= _MAX_TEXT_IMAGE_REFS:
+                    break
+                candidate = Path(os.path.expanduser(ref))
+                try:
+                    resolved = candidate.resolve()
+                    if not resolved.is_file() or not resolved.is_relative_to(allowed_root):
+                        continue
+                except OSError:
+                    continue
+                if str(resolved) in known:
+                    continue
+                known.add(str(resolved))
+                merged.append(str(resolved))
+            if len(merged) > len(image_paths):
+                logger.info(
+                    "Image routing: %d image path(s) named in the text joined the attachments.",
+                    len(merged) - len(image_paths),
+                )
+            return merged
+        except Exception as exc:
+            logger.debug("text image-ref merge failed: %s", exc, exc_info=True)
+            return image_paths
+
     async def _enrich_inbound_images(
         self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
     ) -> str:
@@ -1625,6 +1679,7 @@ class GatewayInboundMixin:
 
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
+        image_paths = self._merge_text_image_refs(message_text, image_paths)
         if image_paths:
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:

@@ -520,12 +520,27 @@ class GatewaySessionCommandsMixin:
                 return _agg_note
         if _preview:
             return _compress_preview_reply(history, partial, keep_last, focus_topic, _agg_note)
+        await self._announce_manual_compression(event, source)
         try:
             return await self._run_manual_compression(source, session_entry, history, partial,
                                                       keep_last, focus_topic)
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
+
+    async def _announce_manual_compression(self, event: MessageEvent, source) -> None:
+        """Tell the user the work started, before it starts.
+
+        Manual compression runs inline and only answers when the summariser returns — minutes on a
+        long transcript. Without this the command looks dropped, which is how a three-minute wait
+        reads in a chat window. Best-effort: a failed notice must not cost the compression itself.
+        """
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        with contextlib.suppress(Exception):
+            await adapter.send(source.chat_id, t("gateway.compress.started"),
+                               metadata=self._reply_metadata(event))
 
     async def _run_manual_compression(self, source, session_entry, history: list, partial: bool,
                                       keep_last, focus_topic) -> str:

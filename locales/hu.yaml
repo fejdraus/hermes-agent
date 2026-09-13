@@ -98,6 +98,7 @@ gateway:
     out_of_range:          "_(A kért {requested}. oldal a tartományon kívül esik, a(z) {page}. oldal jelenik meg.)_"
 
   compress:
+    started:            "⏳ Kontextus tömörítése — hosszú munkamenetnél ez több percig tarthat. Az eredmény ezután érkezik."
     not_enough:            "Nincs elég beszélgetés a tömörítéshez (legalább 4 üzenet kell)."
     no_provider:           "Nincs konfigurált szolgáltató — nem lehet tömöríteni."
     nothing_to_do:         "Még nincs mit tömöríteni (a teljes átirat még védett kontextus)."

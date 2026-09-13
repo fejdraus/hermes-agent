@@ -98,6 +98,7 @@ gateway:
     out_of_range:          "_(Versoekte bladsy {requested} was buite reikwydte; bladsy {page} word vertoon.)_"
 
   compress:
+    started:            "⏳ Konteks word gekomprimeer — op 'n lang sessie kan dit 'n paar minute neem. Die resultaat volg."
     not_enough:            "Nie genoeg gesprek om saam te pers nie (ten minste 4 boodskappe nodig)."
     no_provider:           "Geen verskaffer opgestel nie -- kan nie saampers nie."
     nothing_to_do:         "Niks om saam te pers nie (die transkripsie is steeds heeltemal beskermde konteks)."

@@ -98,6 +98,7 @@ gateway:
     out_of_range:          "_(Angeforderte Seite {requested} liegt außerhalb des Bereichs, Seite {page} wird angezeigt.)_"
 
   compress:
+    started:            "⏳ Kontext wird komprimiert — bei einer langen Sitzung dauert das einige Minuten. Das Ergebnis folgt."
     not_enough:            "Nicht genug Konversation zum Komprimieren (mindestens 4 Nachrichten erforderlich)."
     no_provider:           "Kein Anbieter konfiguriert — Komprimierung nicht möglich."
     nothing_to_do:         "Noch nichts zu komprimieren (das Transkript ist weiterhin vollständig geschützter Kontext)."

@@ -102,6 +102,7 @@ gateway:
     out_of_range:          "_(Bhí leathanach {requested} a iarradh as raon, ag taispeáint leathanach {page}.)_"
 
   compress:
+    started:            "⏳ Comhthéacs á chomhbhrú — ar sheisiún fada tógann sé cúpla nóiméad. Leanfaidh an toradh."
     not_enough:            "Níl go leor comhrá le dlúthú (teastaíonn 4 theachtaireacht ar a laghad)."
     no_provider:           "Níl aon soláthraí cumraithe — ní féidir dlúthú."
     nothing_to_do:         "Níl aon rud le dlúthú fós (tá an traschríbhinn fós uile mar chomhthéacs cosanta)."

@@ -98,6 +98,7 @@ gateway:
     out_of_range:          "_(İstenen sayfa {requested} aralık dışındaydı, sayfa {page} gösteriliyor.)_"
 
   compress:
+    started:            "⏳ Bağlam sıkıştırılıyor — uzun bir oturumda bu birkaç dakika sürebilir. Sonuç ardından gelecek."
     not_enough:            "Sıkıştırmak için yeterli konuşma yok (en az 4 mesaj gerekli)."
     no_provider:           "Yapılandırılmış sağlayıcı yok — sıkıştırılamıyor."
     nothing_to_do:         "Henüz sıkıştırılacak bir şey yok (transkript hâlâ tamamen korunan bağlam)."

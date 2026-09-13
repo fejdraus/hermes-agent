@@ -113,6 +113,7 @@ gateway:
     out_of_range:          "_(Requested page {requested} was out of range, showing page {page}.)_"
 
   compress:
+    started:            "⏳ Compressing context — on a long session this can take a few minutes. The result follows when it lands."
     not_enough:            "Not enough conversation to compress (need at least 4 messages)."
     no_provider:           "No provider configured -- cannot compress."
     nothing_to_do:         "Nothing to compress yet (the transcript is still all protected context)."

@@ -98,6 +98,7 @@ gateway:
     out_of_range:          "_（请求的第 {requested} 页超出范围，显示第 {page} 页。）_"
 
   compress:
+    started:            "⏳ 正在压缩上下文 — 长会话可能需要几分钟。完成后会发送结果。"
     not_enough:            "对话内容不足，无法压缩（至少需要 4 条消息）。"
     no_provider:           "未配置提供方 — 无法压缩。"
     nothing_to_do:         "暂无可压缩内容（对话记录仍全部为受保护上下文）。"

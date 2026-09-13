@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -49,24 +50,24 @@ def announce():
     return GatewaySessionCommandsMixin._announce_manual_compression
 
 
-async def test_notice_is_sent_before_work(announce):
+def test_notice_is_sent_before_work(announce):
     adapter = _Adapter()
-    await announce(_Gateway(adapter), object(), _Source())
+    asyncio.run(announce(_Gateway(adapter), object(), _Source()))
     assert len(adapter.sent) == 1
     chat_id, text = adapter.sent[0]
     assert chat_id == "chat-1" and text.strip()
 
 
-async def test_transport_failure_does_not_propagate(announce):
-    await announce(_Gateway(_Adapter(fail=True)), object(), _Source())
+def test_transport_failure_does_not_propagate(announce):
+    asyncio.run(announce(_Gateway(_Adapter(fail=True)), object(), _Source()))
 
 
-async def test_missing_adapter_is_tolerated(announce):
+def test_missing_adapter_is_tolerated(announce):
     class _NoAdapter(_Gateway):
         def _adapter_for_source(self, source):
             return None
 
-    await announce(_NoAdapter(None), object(), _Source())
+    asyncio.run(announce(_NoAdapter(None), object(), _Source()))
 
 
 def test_every_locale_defines_the_start_notice():

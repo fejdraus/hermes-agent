@@ -74,3 +74,27 @@ def test_session_count_reads_when_the_db_is_free(db, monkeypatch):
 
     monkeypatch.setattr("hermes_cli.state_db_readonly.live_process_holds_state_db", lambda _p=None: False)
     assert doctor_state._session_count(db) == 1
+
+
+def test_stats_snapshot_declines_while_the_db_is_held(db, monkeypatch):
+    """Even a mode=ro connection creates and then unlinks the sidecars."""
+    from hermes_state_dbfile import collect_state_db_stats
+
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _p: [(7, "gateway")])
+
+    def fail(*_a, **_k):
+        raise AssertionError("stats opened a database another process holds")
+
+    monkeypatch.setattr("hermes_state._connect_tracked_db", fail)
+    stats = collect_state_db_stats(db)
+    assert stats["holders_prevented_read"] is True
+    assert stats["messages"] is None
+
+
+def test_stats_snapshot_reads_when_nobody_holds_it(db, monkeypatch):
+    from hermes_state_dbfile import collect_state_db_stats
+
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _p: [])
+    stats = collect_state_db_stats(db)
+    assert stats.get("holders_prevented_read") is None
+    assert stats["page_size"] is not None

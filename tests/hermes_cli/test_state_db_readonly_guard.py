@@ -17,8 +17,11 @@ from hermes_cli.state_db_readonly import live_process_holds_state_db
 
 @pytest.fixture
 def db(tmp_path) -> Path:
+    """A real (empty) SQLite file: the guard checks holders, the counter parses the file."""
+    import sqlite3
+
     path = tmp_path / "state.db"
-    path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
+    sqlite3.connect(str(path)).close()
     return path
 
 
@@ -64,7 +67,7 @@ def test_session_count_reads_when_the_db_is_free(db, monkeypatch):
     from hermes_cli import doctor_state
 
     real = sqlite3.connect(str(db))
-    real.execute("CREATE TABLE sessions (id TEXT)")
+    real.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT)")
     real.execute("INSERT INTO sessions VALUES ('a')")
     real.commit()
     real.close()

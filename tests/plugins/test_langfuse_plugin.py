@@ -929,7 +929,7 @@ class TestModelAttribution:
 
         class _Client:
             def create_trace_id(self, seed=None): return "t"
-            def start_as_current_observation(self, **kw): return _RootCM()
+            def start_observation(self, **kw): return _Span()
             def flush(self): pass
 
         return _Client()
@@ -1200,9 +1200,9 @@ class TestCaptureModes:
 
         class _Client:
             def create_trace_id(self, seed=None): return "t1"
-            def start_as_current_observation(self, **kw):
+            def start_observation(self, **kw):
                 seen.update(kw)
-                return _RootCM()
+                return _Span()
 
         state = mod._start_root_trace(
             "k", task_id="t", session_id="s", platform="cli", provider="p",
@@ -2008,8 +2008,8 @@ class TestFinishTraceUsesUpdateTrace:
             def create_trace_id(self, seed=None):
                 return f"trace::{seed}"
 
-            def start_as_current_observation(self, **kw):
-                return _RootCM()
+            def start_observation(self, **kw):
+                              return _Span()
 
             def flush(self):
                 pass
@@ -2085,8 +2085,8 @@ class TestFinishTraceUsesUpdateTrace:
             def create_trace_id(self, seed=None):
                 return f"trace::{seed}"
 
-            def start_as_current_observation(self, **kw):
-                return _RootCM()
+            def start_observation(self, **kw):
+                              return _Span()
 
             def flush(self):
                 pass

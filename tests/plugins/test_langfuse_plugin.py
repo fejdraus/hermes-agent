@@ -245,9 +245,9 @@ class TestTurnTraceIsolation:
         """A minimal Langfuse stand-in that records each root trace opened.
 
         ``_start_root_trace`` calls ``create_trace_id`` then opens a root via
-        ``start_as_current_observation(...)`` (a context manager whose
-        ``__enter__`` returns the root span).  We record one entry per root
-        actually opened so the test can count distinct traces.
+        ``start_observation(...)``, which returns the span WITHOUT making it the
+        context-current one.  We record one entry per root actually opened so the
+        test can count distinct traces.
         """
 
         class _Span:
@@ -274,9 +274,9 @@ class TestTurnTraceIsolation:
             def create_trace_id(self, seed=None):
                 return f"trace::{seed}"
 
-            def start_as_current_observation(self, **kw):
+            def start_observation(self, **kw):
                 started.append(kw.get("trace_context", {}).get("trace_id"))
-                return _RootCM()
+                return _Span()
 
             def flush(self):
                 pass
@@ -379,45 +379,37 @@ class TestTurnTraceIsolation:
         surviving = sorted(int(k.rsplit("turn", 1)[1]) for k in mod._TRACE_STATE)
         assert surviving == list(range(42, 50))
 
-    def test_finish_trace_exits_root_context_manager(self, monkeypatch):
-        """_finish_trace must call root_ctx.__exit__(), not just root_span.end().
+    def test_finish_trace_ends_root_without_any_context_manager(self, monkeypatch):
+        """The root is ended with ``end()`` and no context is ever entered.
 
-        Regression for the "Exception ignored in: <generator>" traceback
-        on CLI exit.  The plugin enters the root observation's context
-        manager (start_as_current_observation(...).__enter__()) but must
-        also exit it; otherwise the generator is left suspended and is
-        only unwound when the GC collects it during interpreter teardown.
-        By then opentelemetry.trace.Span has been set to None, and the
-        generator's close() -> use_span.__exit__ -> isinstance(span, Span)
-        raises TypeError: isinstance() arg 2 must be a type.  Exiting the
-        context manager here unwinds the generator while modules are intact.
+        History: the plugin used to open the root through
+        ``start_as_current_observation(...).__enter__()`` and had to remember to exit it,
+        or the suspended generator was unwound by the GC at interpreter teardown, where
+        ``opentelemetry.trace.Span`` is already None and ``use_span.__exit__`` raised
+        ``TypeError: isinstance() arg 2 must be a type``. Attaching the context also broke
+        across threads: a turn opened in one and ended in another logged "Failed to detach
+        context" every time. The root is now created unattached, so there is no context to
+        leave behind — the guarantee to keep is that it still gets ended.
         """
         mod = self._fresh_plugin()
         started: list = []
+        ended: list = []
         monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
         mod._TRACE_STATE.clear()
 
-        exited: list = []
-
         class _S:
             def update(self, **kw): pass
-            def end(self, **kw): pass
+            def end(self, **kw): ended.append(True)
             def set_trace_io(self, **kw): pass
+            def update_trace(self, **kw): pass
             def start_observation(self, **kw): return _S()
-
-        class _TrackingRootCM:
-            def __enter__(self):
-                return _S()
-            def __exit__(self, *exc):
-                exited.append(exc)
-                return False
 
         class _TrackingClient:
             def create_trace_id(self, seed=None):
                 return f"trace::{seed}"
-            def start_as_current_observation(self, **kw):
+            def start_observation(self, **kw):
                 started.append(kw.get("trace_context", {}).get("trace_id"))
-                return _TrackingRootCM()
+                return _S()
             def flush(self):
                 pass
 
@@ -425,40 +417,13 @@ class TestTurnTraceIsolation:
 
         self._run_turn(mod, session="sess-exit", turn_n=1, finalize=True)
 
-        assert exited, (
-            "_finish_trace did not call root_ctx.__exit__; the generator is "
-            "left suspended and will raise TypeError on GC at interpreter "
-            "teardown when opentelemetry.trace.Span is None"
-        )
-        assert len(exited) == 1
-        assert exited[0] == (None, None, None)
-
-
-# ---------------------------------------------------------------------------
-# Placeholder-credential guard (#23823).
-#
-# Regression coverage for the silent-failure bug: when an operator leaves
-# HERMES_LANGFUSE_PUBLIC_KEY / SECRET_KEY at a template value like
-# "placeholder", "test-key", or "your-langfuse-key", the SDK accepts the
-# credentials at construction time (it does no server-side validation
-# eagerly) but drops every trace at flush time, with no signal in the
-# Hermes logs.  The fix in `_get_langfuse()` validates the documented
-# `pk-lf-` / `sk-lf-` prefix Langfuse always issues, surfaces a one-shot
-# warning naming the offending env var(s), and short-circuits via the
-# same `_INIT_FAILED` path used for missing credentials so subsequent
-# hook invocations don't re-log.
-# ---------------------------------------------------------------------------
-
-
-class _FakeLangfuse:
-    """Stand-in for the real :class:`langfuse.Langfuse` so tests don't
-    need the optional ``langfuse`` SDK installed.  The plugin's runtime
-    gate refuses to proceed past ``if Langfuse is None`` when the SDK
-    is missing, which would short-circuit before the placeholder check
-    can fire.  Patching ``plugin.Langfuse`` with this class lets the
-    placeholder validator exercise its full code path."""
-
-    instances: list["_FakeLangfuse"] = []
+        assert started, "no root observation was opened"
+        assert ended, "_finish_trace left the root span open"
+        for state in mod._TRACE_STATE.values():
+            assert getattr(state, "root_ctx", None) is None, (
+                "a root context manager was entered; the plugin must create the root "
+                "unattached so no context can be left to unwind"
+            )
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs

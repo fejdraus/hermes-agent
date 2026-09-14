@@ -24,12 +24,10 @@ def _pdf(path, *, text: str | None) -> str:
     page holding one short phrase is legitimately indistinguishable from page furniture.
     """
     if text:
-        lines = "
-".join(
-            f"BT /F1 11 Tf 72 {720 - 14 * i} Td ({text} — line {i:02d} of the report) Tj ET"
+        body = chr(10).join(
+            f"BT /F1 11 Tf 72 {720 - 14 * i} Td ({text} - line {i:02d} of the report) Tj ET"
             for i in range(40)
         )
-        body = lines
     else:
         body = "72 700 m 200 700 l S"
     objs = [

@@ -18,8 +18,20 @@ pytestmark = pytest.mark.skipif(shutil.which("pdftotext") is None, reason="pdfto
 
 
 def _pdf(path, *, text: str | None) -> str:
-    """Minimal one-page PDF, with a text layer or with none."""
-    body = f"BT /F1 24 Tf 72 700 Td ({text}) Tj ET" if text else "72 700 m 200 700 l S"
+    """Minimal one-page PDF, with a text layer or with none.
+
+    A text page carries a realistic amount of prose: the check measures text density, so a
+    page holding one short phrase is legitimately indistinguishable from page furniture.
+    """
+    if text:
+        lines = "
+".join(
+            f"BT /F1 11 Tf 72 {720 - 14 * i} Td ({text} — line {i:02d} of the report) Tj ET"
+            for i in range(40)
+        )
+        body = lines
+    else:
+        body = "72 700 m 200 700 l S"
     objs = [
         "<< /Type /Catalog /Pages 2 0 R >>",
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",

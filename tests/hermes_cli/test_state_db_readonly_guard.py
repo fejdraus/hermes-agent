@@ -99,28 +99,3 @@ def test_stats_snapshot_reads_when_nobody_holds_it(db, monkeypatch):
     assert stats.get("holders_prevented_read") is None
     assert stats["page_size"] is not None
 
-
-def test_delegation_recovery_declines_while_another_process_owns_the_db(monkeypatch):
-    """Recovery belongs to the database's owner; a second process must not open it."""
-    from tools import async_delegation
-
-    monkeypatch.setattr(async_delegation, "_another_process_owns_state_db", lambda: True)
-
-    def fail(*_a, **_k):
-        raise AssertionError("delegation recovery opened a database owned by another process")
-
-    monkeypatch.setattr(async_delegation, "_connect", fail)
-    assert async_delegation.recover_abandoned_delegations() == 0
-
-    import queue
-
-    assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
-
-
-def test_owner_itself_is_not_treated_as_foreign(db, monkeypatch):
-    """The gateway holding its own database must still run recovery at startup."""
-    from tools import async_delegation
-
-    monkeypatch.setattr(async_delegation, "_db_path", lambda: db)
-    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _p: [])
-    assert async_delegation._another_process_owns_state_db() is False

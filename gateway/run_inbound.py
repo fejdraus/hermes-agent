@@ -37,6 +37,9 @@ logger = logging.getLogger("gateway.run")
 
 _MAX_TEXT_IMAGE_REFS = 4
 
+# Attachment kinds that arrive in bursts and must never interrupt a running turn.
+_ATTACHMENT_BURST_TYPES = frozenset({MessageType.PHOTO, MessageType.DOCUMENT, MessageType.VIDEO})
+
 
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
@@ -530,10 +533,15 @@ class GatewayInboundMixin:
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
 
-        # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
-        # photo-only follow-up; adapter-level batching absorbs them.
-        if event.message_type == MessageType.PHOTO:
-            logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
+        # A burst of attachments arrives as near-simultaneous updates and is one intent: the user
+        # selected several files and sent them. Interrupting the turn for the second file of the
+        # same batch cancels the work the first one started — and with it the provider stream, which
+        # surfaces as a connection error rather than as anything the user would recognise. Bursts
+        # are absorbed by adapter-level batching instead. Voice is deliberately excluded: speech is
+        # how a user interrupts on purpose.
+        if event.message_type in _ATTACHMENT_BURST_TYPES and getattr(event, "media_urls", None):
+            logger.debug("PRIORITY attachment follow-up (%s) for session %s — queueing without interrupt",
+                         event.message_type, _quick_key)
             self._hm_merge_pending_for_source(source, _quick_key, event)
             return True, None
         return False, None

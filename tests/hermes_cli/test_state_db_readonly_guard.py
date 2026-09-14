@@ -1,0 +1,73 @@
+"""Читающие команды не открывают state.db работающего агента.
+
+Второй процесс, открывший базу, при закрытии чекпойнтит и УДАЛЯЕТ `state.db-wal`/`-shm`.
+Живой gateway остаётся с дескрипторами на удалённые иноды, и его следующая запись падает
+с DeletedWalGenerationError — пользователь видит «unexpected error» на своём следующем
+сообщении, далеко от команды, которая всё сломала. Поэтому проверка держателей идёт
+по таблице процессов и при любом сомнении отвечает «занято».
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.state_db_readonly import live_process_holds_state_db
+
+
+@pytest.fixture
+def db(tmp_path) -> Path:
+    path = tmp_path / "state.db"
+    path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
+    return path
+
+
+def test_reports_busy_when_a_process_holds_the_db(db, monkeypatch):
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _p: [(4242, str(db))])
+    assert live_process_holds_state_db(db) is True
+
+
+def test_reports_free_when_nobody_holds_it(db, monkeypatch):
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _p: [])
+    assert live_process_holds_state_db(db) is False
+
+
+def test_unknown_holders_count_as_busy(db, monkeypatch):
+    """Fail closed: a failed scan must not be read as quiet."""
+    def boom(_p):
+        raise OSError("cannot read /proc")
+
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", boom)
+    assert live_process_holds_state_db(db) is True
+
+
+def test_absent_database_is_not_busy(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _p: [])
+    assert live_process_holds_state_db(tmp_path / "nothing.db") is False
+
+
+def test_session_count_declines_while_the_db_is_held(db, monkeypatch):
+    from hermes_cli import doctor_state
+
+    monkeypatch.setattr("hermes_cli.state_db_readonly.live_process_holds_state_db", lambda _p=None: True)
+
+    def fail(*_a, **_k):
+        raise AssertionError("doctor opened a database another process holds")
+
+    monkeypatch.setattr("sqlite3.connect", fail)
+    assert doctor_state._session_count(db) is None
+
+
+def test_session_count_reads_when_the_db_is_free(db, monkeypatch):
+    import sqlite3
+
+    from hermes_cli import doctor_state
+
+    real = sqlite3.connect(str(db))
+    real.execute("CREATE TABLE sessions (id TEXT)")
+    real.execute("INSERT INTO sessions VALUES ('a')")
+    real.commit()
+    real.close()
+
+    monkeypatch.setattr("hermes_cli.state_db_readonly.live_process_holds_state_db", lambda _p=None: False)
+    assert doctor_state._session_count(db) == 1

@@ -425,6 +425,19 @@ class TestTurnTraceIsolation:
                 "unattached so no context can be left to unwind"
             )
 
+# ---------------------------------------------------------------------------
+
+
+class _FakeLangfuse:
+    """Stand-in for the real :class:`langfuse.Langfuse` so tests don't
+    need the optional ``langfuse`` SDK installed.  The plugin's runtime
+    gate refuses to proceed past ``if Langfuse is None`` when the SDK
+    is missing, which would short-circuit before the placeholder check
+    can fire.  Patching ``plugin.Langfuse`` with this class lets the
+    placeholder validator exercise its full code path."""
+
+    instances: list["_FakeLangfuse"] = []
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         _FakeLangfuse.instances.append(self)

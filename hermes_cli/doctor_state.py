@@ -226,6 +226,14 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
         check_ok(f"{_DHH}/state.db exists ({_detail})")
         # COUNT(*) succeeds even when the FTS index is corrupt and every write fails through the triggers;
         # _db_opens_cleanly drives a rolled-back write to surface that.
+        from hermes_cli.state_db_readonly import live_process_holds_state_db
+        if live_process_holds_state_db(state_db_path):
+            # The probe below opens its own connection and drives a rolled-back write. Closing it
+            # unlinks the WAL sidecars the running gateway still holds, so the health check would
+            # create the very corruption it looks for.
+            check_info(f"{_DHH}/state.db write-health not probed (the gateway has it open; "
+                       "stop the profile's gateway and re-run to check)")
+            return
         from hermes_state_repair import _db_opens_cleanly, state_db_has_structural_damage
         # `_db_opens_cleanly` now drives a rolled-back write so this otherwise-silent corruption class is
         # surfaced (and repaired in place with --fix). See #50502.

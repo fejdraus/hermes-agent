@@ -2487,6 +2487,46 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
+_SCANNED_PDF_PROBE_PAGES = 2
+_SCANNED_PDF_MIN_CHARS = 24
+
+
+def _pdf_extractable_chars(path: str) -> Optional[int]:
+    """Characters of text in the first pages of a PDF; None when it cannot be determined.
+
+    Only the opening pages are probed: the question is whether a text layer exists at all,
+    and a full extraction of a large scan would stall the inbound path.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("pdftotext") is None:
+        return None
+    try:
+        done = subprocess.run(
+            ["pdftotext", "-l", str(_SCANNED_PDF_PROBE_PAGES), path, "-"],
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return len(done.stdout.decode("utf-8", "ignore").strip())
+
+
+def _document_is_scanned_pdf(agent_path: str, mtype: str) -> bool:
+    """True when the file is a PDF whose pages carry no extractable text.
+
+    Such a file is an image wearing a document's extension: text extraction returns nothing,
+    and an agent that reads that emptiness as "the document is blank" silently drops whatever
+    the user sent. Saying so in the note is what turns a dead end into an OCR step.
+    """
+    if "pdf" not in mtype.lower() and not agent_path.lower().endswith(".pdf"):
+        return False
+    chars = _pdf_extractable_chars(agent_path)
+    return chars is not None and chars < _SCANNED_PDF_MIN_CHARS
+
+
 def _build_document_context_note(
     display_name: str, agent_path: str, mtype: str, *, content_inlined: bool = True) -> str:
     """Context note prepended to a user turn when they attach a document.
@@ -2501,6 +2541,13 @@ def _build_document_context_note(
             f"[The user sent a text document: '{display_name}'. It is saved at: {agent_path}. "
             f"Its content is not inlined here. Read the cached file yourself before answering "
             f"when the user's request involves its contents.]")
+    if _document_is_scanned_pdf(agent_path, mtype):
+        return (
+            f"[The user sent a SCANNED document: '{display_name}'. It is saved at: {agent_path}. "
+            f"It has NO text layer — text extraction returns nothing, which does not mean the "
+            f"document is empty. Read it by rendering its pages to images and running "
+            f"vision_analyze on each (the ocr-and-documents skill has the commands). Never report "
+            f"it as blank or skip it without having looked at the rendered pages.]")
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
         f"Its text is not inlined here (it's a binary format such as PDF or DOCX). "

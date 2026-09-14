@@ -539,7 +539,7 @@ class GatewayInboundMixin:
         # surfaces as a connection error rather than as anything the user would recognise. Bursts
         # are absorbed by adapter-level batching instead. Voice is deliberately excluded: speech is
         # how a user interrupts on purpose.
-        if event.message_type in _ATTACHMENT_BURST_TYPES and getattr(event, "media_urls", None):
+        if event.message_type in _ATTACHMENT_BURST_TYPES:
             logger.debug("PRIORITY attachment follow-up (%s) for session %s — queueing without interrupt",
                          event.message_type, _quick_key)
             self._hm_merge_pending_for_source(source, _quick_key, event)

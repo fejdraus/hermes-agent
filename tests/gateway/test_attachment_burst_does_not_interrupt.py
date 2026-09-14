@@ -29,12 +29,18 @@ def test_documents_were_the_gap():
     assert MessageType.PHOTO in _ATTACHMENT_BURST_TYPES
 
 
-def test_burst_branch_requires_actual_media():
-    """A typed-but-empty event must fall through rather than be swallowed silently."""
+def test_burst_branch_keys_on_type_alone():
+    """The decision must not depend on media_urls.
+
+    The gateway sees the message before its attachment is downloaded, so ``media_urls`` is
+    still empty at this point — which is why the pre-existing photo branch keys on the
+    message type alone. Requiring a populated list sent the first document of a batch back
+    to the interrupt path, exactly the case this branch exists to prevent.
+    """
     import inspect
 
     from gateway.run_inbound import GatewayInboundMixin
 
     src = inspect.getsource(GatewayInboundMixin._hm_busy_slash_or_photo)
-    assert "_ATTACHMENT_BURST_TYPES" in src
-    assert 'getattr(event, "media_urls", None)' in src
+    burst = src[src.index("_ATTACHMENT_BURST_TYPES"):]
+    assert "media_urls" not in burst.split("return True")[0]

@@ -336,6 +336,22 @@ def _mask_data_uris(*, data: Any, **_kwargs: Any) -> Any:
         return {"type": "data_uri", "media_type": media_type or None,
                 "omitted": True, "length": len(value)}
 
+    def carrier_media_type(value: Dict[str, Any]) -> Optional[str]:
+        """Media type when this dict is one the SDK itself decodes, else None.
+
+        The SDK reads media from a bare payload dict as well as from a data URI: the
+        Anthropic shape carries ``media_type``, the Vertex one ``mime_type``, and for both
+        it prepends the header to ``data`` before decoding. A payload our serializers
+        already truncated then fails to decode, so the redaction has to cover every shape
+        the SDK claims, not only the string form.
+        """
+        marker = value.get("type")
+        key = {"base64": "media_type", "media": "mime_type"}.get(marker if isinstance(marker, str) else "")
+        if key is None or not isinstance(value.get("data"), str):
+            return None
+        declared = value.get(key)
+        return declared if isinstance(declared, str) else ""
+
     def walk(value: Any, depth: int = 0) -> Any:
         if depth > 12:
             return value
@@ -343,6 +359,10 @@ def _mask_data_uris(*, data: Any, **_kwargs: Any) -> Any:
             prefix = value[:64]
             return redact(value) if prefix.startswith("data:") and ";base64," in prefix else value
         if isinstance(value, dict):
+            media_type = carrier_media_type(value)
+            if media_type is not None:
+                return {"type": "data_uri", "media_type": media_type or None,
+                        "omitted": True, "length": len(value["data"])}
             return {k: walk(v, depth + 1) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [walk(v, depth + 1) for v in value]
@@ -603,9 +623,18 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id, **({"session_id": session_id} if session_id else {})}
 
     def open_root():
-        ctx = client.start_as_current_observation(trace_context=trace_ctx, name="Hermes turn", as_type="chain",
-                                                  input=trace_input, metadata=metadata, end_on_exit=False)
-        return ctx, ctx.__enter__()
+        """Root observation WITHOUT making it the context-current span.
+
+        A turn is entered on one thread and ended on another (the gateway runs the agent in
+        an executor), so attaching the OpenTelemetry context here and detaching it there
+        makes the detach token belong to a context that no longer exists: every turn logged
+        ``Failed to detach context`` with a full traceback, hundreds a day, and real errors
+        drowned in them. Nothing needs the current-span slot — every child observation is
+        created from this span explicitly — so the span is created unattached and simply
+        ended when the turn finishes.
+        """
+        return None, client.start_observation(trace_context=trace_ctx, name="Hermes turn", as_type="chain",
+                                              input=trace_input, metadata=metadata)
 
     root_ctx = root_span = None
     if propagate_attributes is not None:
@@ -614,8 +643,8 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
                                       tags=["hermes", "langfuse"]):
                 root_ctx, root_span = open_root()
         except Exception:
-            root_ctx = None
-    if root_ctx is None:
+            root_span = None
+    if root_span is None:
         root_ctx, root_span = open_root()
 
     with _failsafe("update_trace(input)"):  # SDK v3 uses update_trace()

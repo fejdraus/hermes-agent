@@ -2488,7 +2488,11 @@ def _build_media_placeholder(event) -> str:
 
 
 _SCANNED_PDF_PROBE_PAGES = 2
-_SCANNED_PDF_MIN_CHARS = 24
+# Per page, because the signal is text DENSITY, not volume: a scan yields only page
+# furniture (a header, a number), a real page yields prose. Measured on a batch of lab
+# PDFs the two sit orders of magnitude apart — 14 chars/page for the scan against 719
+# for the sparsest real document — so the threshold sits in the empty space between them.
+_SCANNED_PDF_MIN_CHARS_PER_PAGE = 80
 
 
 def _pdf_extractable_chars(path: str) -> Optional[int]:
@@ -2524,7 +2528,9 @@ def _document_is_scanned_pdf(agent_path: str, mtype: str) -> bool:
     if "pdf" not in mtype.lower() and not agent_path.lower().endswith(".pdf"):
         return False
     chars = _pdf_extractable_chars(agent_path)
-    return chars is not None and chars < _SCANNED_PDF_MIN_CHARS
+    if chars is None:
+        return False
+    return chars / _SCANNED_PDF_PROBE_PAGES < _SCANNED_PDF_MIN_CHARS_PER_PAGE
 
 
 def _build_document_context_note(

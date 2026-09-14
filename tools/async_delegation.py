@@ -82,6 +82,21 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
+def _another_process_owns_state_db() -> bool:
+    """Whether a different process currently holds state.db open.
+
+    Delegation recovery belongs to whoever owns the database. A second process doing it
+    opens its own connection, and closing that connection unlinks the WAL sidecars the
+    owner still holds — the owner's next write then fails. Unknown counts as owned.
+    """
+    try:
+        from hermes_state_holders import foreign_state_db_holders
+
+        return bool(foreign_state_db_holders(_db_path()))
+    except Exception:
+        return True
+
+
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +257,8 @@ def recover_abandoned_delegations() -> int:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
         return 0
+    if _another_process_owns_state_db():
+        return 0
     now, recovered = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
@@ -292,6 +309,8 @@ def restore_undelivered_completions(target_queue) -> int:
     ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
     (#64484).
     """
+    if _another_process_owns_state_db():
+        return 0
     recover_abandoned_delegations()
     now, restored = time.time(), 0
     with _DB_LOCK, _transaction() as conn:

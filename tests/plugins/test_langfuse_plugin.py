@@ -1993,23 +1993,14 @@ class TestFinishTraceUsesUpdateTrace:
 
             # Deliberately NO set_trace_io — mirrors real LangfuseChain.
 
-        class _RootCM:
-            def __init__(self):
-                self.span = _Span()
-                roots.append(self.span)
-
-            def __enter__(self):
-                return self.span
-
-            def __exit__(self, *exc):
-                return False
-
         class _Client:
             def create_trace_id(self, seed=None):
                 return f"trace::{seed}"
 
             def start_observation(self, **kw):
-                              return _Span()
+                span = _Span()
+                roots.append(span)
+                return span
 
             def flush(self):
                 pass
@@ -2070,23 +2061,14 @@ class TestFinishTraceUsesUpdateTrace:
             def start_observation(self, **kw):
                 return _Span()
 
-        class _RootCM:
-            def __init__(self):
-                self.span = _Span()
-                roots.append(self.span)
-
-            def __enter__(self):
-                return self.span
-
-            def __exit__(self, *exc):
-                return False
-
         class _Client:
             def create_trace_id(self, seed=None):
                 return f"trace::{seed}"
 
             def start_observation(self, **kw):
-                              return _Span()
+                span = _Span()
+                roots.append(span)
+                return span
 
             def flush(self):
                 pass

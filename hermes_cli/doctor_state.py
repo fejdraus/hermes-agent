@@ -153,16 +153,6 @@ def _check_directory_structure(should_fix: bool, f: Finding) -> None:
 
 
 def _session_count(state_db_path: Path):
-    """Session count, or None while another process holds the database.
-
-    Closing this connection would checkpoint and unlink the WAL sidecars a running gateway
-    still has open, and its next write would then refuse with DeletedWalGenerationError. A
-    diagnostic that breaks the thing it inspects is worse than one metric short.
-    """
-    from hermes_cli.state_db_readonly import live_process_holds_state_db
-
-    if live_process_holds_state_db(state_db_path):
-        return None
     import sqlite3
     conn = sqlite3.connect(str(state_db_path))
     try:
@@ -209,8 +199,7 @@ def _repair_state_db(f: Finding, should_fix: bool, state_db_path: Path, kind: st
         return f.issues.append(failed_issue)
     if "{count}" in ok_label:
         try:
-            _count = _session_count(state_db_path)
-            ok_label = ok_label.format(count="?" if _count is None else _count)
+            ok_label = ok_label.format(count=_session_count(state_db_path))
         except Exception:
             ok_label = ok_label.format(count="?")
     backup_name = Path(report["backup_path"]).name if report.get("backup_path") else "n/a"
@@ -221,19 +210,9 @@ def _repair_state_db(f: Finding, should_fix: bool, state_db_path: Path, kind: st
 def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: str) -> None:
     """Session count + FTS write-health probe; malformed-schema path when even COUNT(*) fails."""
     try:
-        _count = _session_count(state_db_path)
-        _detail = "gateway holds it open — not counted" if _count is None else f"{_count} sessions"
-        check_ok(f"{_DHH}/state.db exists ({_detail})")
+        check_ok(f"{_DHH}/state.db exists ({_session_count(state_db_path)} sessions)")
         # COUNT(*) succeeds even when the FTS index is corrupt and every write fails through the triggers;
         # _db_opens_cleanly drives a rolled-back write to surface that.
-        from hermes_cli.state_db_readonly import live_process_holds_state_db
-        if live_process_holds_state_db(state_db_path):
-            # The probe below opens its own connection and drives a rolled-back write. Closing it
-            # unlinks the WAL sidecars the running gateway still holds, so the health check would
-            # create the very corruption it looks for.
-            check_info(f"{_DHH}/state.db write-health not probed (the gateway has it open; "
-                       "stop the profile's gateway and re-run to check)")
-            return
         from hermes_state_repair import _db_opens_cleanly, state_db_has_structural_damage
         # `_db_opens_cleanly` now drives a rolled-back write so this otherwise-silent corruption class is
         # surfaced (and repaired in place with --fix). See #50502.

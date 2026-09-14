@@ -276,24 +276,16 @@ def _render_sessions(ctx):
     _section("Sessions")
     # Gateway session count: state.db is the source of truth; fall back to sessions.json for
     # pre-migration installs.
-    from hermes_cli.state_db_readonly import live_process_holds_state_db
-
-    gateway_rows = []
-    db_busy = live_process_holds_state_db()
-    if not db_busy:
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
         try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-            try:
-                gateway_rows = db.list_gateway_sessions(active_only=True) or []
-            finally:
-                db.close()
-        except Exception:
-            gateway_rows = []
+            gateway_rows = db.list_gateway_sessions(active_only=True) or []
+        finally:
+            db.close()
+    except Exception:
+        gateway_rows = []
 
-    if db_busy and not gateway_rows:
-        _kv("Active:", "(not read — the gateway has state.db open)")
-        return
     if gateway_rows:
         _kv("Active:", f"{len(gateway_rows)} session(s)")
         freshest = max((float(r.get("last_active") or 0) for r in gateway_rows), default=0.0)

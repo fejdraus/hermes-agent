@@ -563,16 +563,6 @@ def quarantine_invalid_state_db(path: Path, *, already_locked: bool = False) -> 
         return _do_quarantine()
 
 
-def _foreign_holders_present(db_path: Path) -> bool:
-    """Whether another process has this database (or a sidecar) open; unknown counts as yes."""
-    try:
-        from hermes_state_holders import foreign_state_db_holders
-
-        return bool(foreign_state_db_holders(Path(db_path)))
-    except Exception:
-        return True
-
-
 def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     """Best-effort, strictly read-only stats snapshot of a state.db file: ``mode=ro`` with a short
     timeout so it can run against a *live* database without taking a write lock.  Every field is
@@ -589,13 +579,6 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     with contextlib.suppress(OSError):
         wal_path = Path(str(db_path) + "-wal")
         stats["wal_size_bytes"] = wal_path.stat().st_size if wal_path.exists() else 0
-    # Read-only is not side-effect-free: SQLite creates the -wal/-shm sidecars on open and
-    # unlinks them when the last connection closes, which strands a running gateway on deleted
-    # inodes and makes its next write fail. When someone else holds the file, the fields that
-    # need no connection are all this may report.
-    if _foreign_holders_present(db_path):
-        stats["holders_prevented_read"] = True
-        return stats
     try:
         # A short timeout keeps doctor snappy when a writer holds the lock.  The tracked connect
         # lets byte-probe helpers see this connection and refuse raw opens that would cancel locks.

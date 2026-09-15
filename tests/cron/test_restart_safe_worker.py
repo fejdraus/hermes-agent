@@ -258,6 +258,49 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
     return spawned, payloads, handoff, get
 
 
+def test_launch_external_worker_treats_a_routed_fire_as_multiplexed(tmp_path, monkeypatch):
+    """A fire routed to another profile is multiplexed at the handoff boundary (#107695 review on
+    f5f88d5058). ``run_one_job`` only enables the context in ``_install_fire_secret_scope``, which runs
+    AFTER this handoff, so a routed desktop fire on the managed path serialized ``multiplex_active=False``
+    and the worker inherited the launch profile's residue. The payload must carry ``True`` and the
+    worker env must not carry a launch-only value — and the context must not outlive the handoff."""
+    import cron.scheduler as scheduler
+    import hermes_constants
+    from agent import secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.process_registry import GatewayChildDispatch
+
+    launch = tmp_path / "launch"
+    routed = tmp_path / "routed"
+    launch.mkdir()
+    routed.mkdir()
+    (launch / ".env").write_text("LAUNCH_ONLY_SECRET=launch-secret\n", encoding="utf-8")
+    (routed / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("LAUNCH_ONLY_SECRET", "launch-secret")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: routed)
+    monkeypatch.setattr(hermes_constants, "get_process_hermes_home", lambda: launch)
+    monkeypatch.setattr("cron.scheduler_provider.routed_profile_fire", lambda: True)
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, *, unit_suffix, require_restart_safe_scope=False: GatewayChildDispatch(
+            "scoped", ["scope", "--", *command]),
+    )
+    spawned, payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+
+    assert not secret_scope.is_multiplex_active()  # the desktop tick itself is NOT a multiplexer
+    home_token = set_hermes_home_override(str(routed))
+    try:
+        assert scheduler._launch_external_cron_worker(
+            {"id": "job-r", "execution_id": "exec-1", "prompt": "work"}) is True
+    finally:
+        reset_hermes_home_override(home_token)
+
+    assert payloads[0]["multiplex_active"] is True
+    assert "LAUNCH_ONLY_SECRET" not in spawned[0][1]["env"]
+    assert not secret_scope.is_multiplex_active()  # enabled for the handoff span only
+    assert os.environ["LAUNCH_ONLY_SECRET"] == "launch-secret"  # parent untouched
+
+
 def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     tmp_path, monkeypatch
 ):
@@ -302,6 +345,73 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     assert payloads[0]["multiplex_active"] is True
     # Once the attempt is terminal the parent reaps its own handoff artifacts.
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
+
+
+def test_launch_external_worker_honors_ack_within_adoption_grace(
+    tmp_path, monkeypatch
+):
+    """A cold worker that acks after 5s but inside the adoption grace is adopted, not abandoned."""
+    import cron.scheduler as scheduler
+    from cron.executions import HANDOFF_ADOPTION_GRACE_SECONDS
+    from tools.process_registry import GatewayChildDispatch
+
+    job = {"id": "job-cold", "execution_id": "exec-cold", "prompt": "work"}
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, **_kw: GatewayChildDispatch("scoped", ["scope", "--", *command]),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_handoff_pending",
+        lambda _execution_id: {"id": "exec-cold", "handoff_pending": 1},
+    )
+    ack_path = tmp_path / "cron/external-workers/exec-cold.ready"
+    ack_at = HANDOFF_ADOPTION_GRACE_SECONDS - 10.0
+    assert ack_at > 5.0
+
+    class FakeClock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+            if self.now >= ack_at and not ack_path.exists():
+                ack_path.write_text(
+                    json.dumps({"pid": 4321, "execution_id": "exec-cold"}),
+                    encoding="utf-8",
+                )
+
+    clock = FakeClock()
+
+    class FakeProcess:
+        pid = 999
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+
+    monkeypatch.setattr(
+        scheduler.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess()
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-cold", "status": "completed"},
+    )
+    monkeypatch.setattr(scheduler.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(scheduler.time, "sleep", clock.sleep)
+    monkeypatch.setattr(scheduler, "_running_worker_pids", {})
+
+    assert scheduler._launch_external_cron_worker(job) is True
+    # The acknowledged path records the worker pid; the ownership-uncertain
+    # timeout path never does.
+    assert scheduler._running_worker_pids == {"job-cold": 4321}
 
 
 def test_external_worker_exit_rechecks_exact_execution_before_failure(monkeypatch):

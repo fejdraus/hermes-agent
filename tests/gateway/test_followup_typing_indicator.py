@@ -71,8 +71,8 @@ def test_drain_path_raises_and_clears_the_indicator():
     """Every exit of the drain — success, failure, cancel — must drop the indicator."""
     import inspect
 
-    from gateway.run_turn import TurnRunner
+    from gateway.run_turn import GatewayTurnMixin
 
-    src = inspect.getsource(TurnRunner._run_agent_queued_followup)
+    src = inspect.getsource(GatewayTurnMixin._run_agent_queued_followup)
     assert src.count("_stop_followup_typing(") == 3, "an exit path leaves the indicator running"
     assert src.index("_start_followup_typing(") < src.index("_stop_followup_typing(")

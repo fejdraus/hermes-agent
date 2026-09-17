@@ -3657,9 +3657,13 @@ class GatewayTurnMixin:
         # place a queued/interrupting message ever runs, so base.py's hook site is never entered for it.
         # Resolve the adapter from the follow-up's OWN source — a multiplexed gateway can route it to a
         # different profile's adapter, and only that instance holds the per-message reaction state.
-        from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
+        from gateway.run_turn_followup_ack import (
+            _followup_cancel_outcome, _run_followup_processing_hook,
+            _start_followup_typing, _stop_followup_typing,
+        )
         _hook_adapter = self._adapter_for_source(next_source) if pending_event is not None else None
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
+        _typing = _start_followup_typing(_hook_adapter, pending_event)
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
@@ -3676,13 +3680,16 @@ class GatewayTurnMixin:
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
+            _stop_followup_typing(_typing)
             raise
         except BaseException:
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.FAILURE)
+            _stop_followup_typing(_typing)
             raise
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+        _stop_followup_typing(_typing)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal

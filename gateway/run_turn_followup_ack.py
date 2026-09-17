@@ -10,8 +10,12 @@ interrupting and steer-demoted messages (#72502, salvage #72503).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, ProcessingOutcome
+
+logger = logging.getLogger(__name__)
 
 
 def _followup_processing_hooks_apply(adapter, event: MessageEvent | None) -> bool:
@@ -58,3 +62,41 @@ async def _run_followup_processing_hook(adapter, event: MessageEvent | None, hoo
     if not callable(run_hook):
         return
     await run_hook(hook_name, event, *args)
+
+
+def _start_followup_typing(adapter, pending_event):
+    """Show the platform's working indicator while a drained follow-up runs.
+
+    The indicator is raised in ``BasePlatformAdapter._process_message_background``, which only
+    runs for a message that OPENS a turn. A message arriving mid-turn is parked and drained
+    here instead, so nothing showed it as being worked on — and an attachment burst, which is
+    absorbed rather than allowed to interrupt, is exactly that case. Minutes of vision work
+    then look identical to a bot that has already finished and said nothing.
+
+    Returns the task to hand back to :func:`_stop_followup_typing`, or None when the adapter
+    has no indicator, the event is not a real inbound message, or spawning it fails — a
+    cosmetic signal must never cost the turn.
+    """
+    if adapter is None or pending_event is None:
+        return None
+    start = getattr(adapter, "_start_typing_refresh", None)
+    if start is None:
+        return None
+    try:
+        metadata = None
+        reply_metadata = getattr(adapter, "_reply_metadata", None)
+        if reply_metadata is not None:
+            with contextlib.suppress(Exception):
+                metadata = reply_metadata(pending_event)
+        return start(pending_event, asyncio.Event(), metadata)
+    except Exception:
+        logger.debug("follow-up typing indicator could not be started", exc_info=True)
+        return None
+
+
+def _stop_followup_typing(task) -> None:
+    """Cancel the follow-up's indicator task; never raises."""
+    if task is None:
+        return
+    with contextlib.suppress(Exception):
+        task.cancel()

@@ -48,16 +48,17 @@ def _profile_scoped_rpc(
                     return err
                 args = (rid, params, session)
             scope = contextlib.nullcontext()
-            if profile := _str_arg(params, "profile") if scoped else "":
+            if scoped:
+                # _profile_home is the ONE resolver: it registers the served home (flipping this
+                # process to fail-closed multi-profile hosting) and answers None for the launch
+                # profile, which then binds its own scope once multiplexing is active.
+                profile = _str_arg(params, "profile")
                 try:
                     try:
-                        profile_dir = _tools_mod("hermes_cli.profiles").get_profile_dir(profile)
-                    except ValueError:  # traversal-shaped name: same answer as a missing dir
-                        profile_dir = None
-                    if not profile_dir or not profile_dir.is_dir():
+                        home = _profile_home(profile)
+                    except ProfileUnavailableError:
                         return _err(rid, 4064, f"profile '{profile}' not found")
-                    _tools_mod("hermes_cli.env_loader").hydrate_profile_secret_sources(profile_dir)
-                    scope = _session_profile_runtime_scope({"profile_home": str(profile_dir)})
+                    scope = _session_profile_runtime_scope({"profile_home": str(home) if home else None})
                 except Exception as e:
                     if not catch_resolve:
                         raise
@@ -118,7 +119,7 @@ def _mcp_named_server(rid, params):
 
 def _busy_error(rid, session, cmd: str):
     if session.get("running"):
-        return _err(rid, 4009, f"session busy — /interrupt the current turn before /{cmd}")
+        return _err(rid, 4009, busy_message(cmd))
     return None
 
 
@@ -945,7 +946,7 @@ def _(rid, params: dict, session) -> dict:
     # Full-history rollback mutates session history → rejected mid-turn (prompt.submit
     # would drop the agent's output or clobber it). File-scoped only touches disk.
     if not file_path and session.get("running"):
-        return _err(rid, 4009, "session busy — /interrupt the current turn before full rollback.restore")
+        return _err(rid, 4009, busy_message("rollback restore"))
 
     def go(mgr, cwd):
         result = mgr.restore(cwd, _resolve_checkpoint_hash(mgr, cwd, target), file_path=file_path or None)
@@ -988,12 +989,13 @@ def _(rid, params: dict) -> dict:
     return _err(rid, 4015, f"unknown action: {action}")
 
 
-@_rpc("config.show", 5030)
+@_scoped_rpc("config.show", 5030)
 def _(rid, params: dict) -> dict:
     cfg = _load_cfg()
-    api_key = _tools_mod("agent.secret_scope").get_secret("HERMES_API_KEY", "") or cfg.get("api_key", "")
+    get_secret = _tools_mod("agent.secret_scope").get_secret
+    api_key = get_secret("HERMES_API_KEY", "") or cfg.get("api_key", "")
     masked = f"****{api_key[-4:]}" if len(api_key) > 4 else "(not set)"
-    base_url = os.environ.get("HERMES_BASE_URL", "") or cfg.get("base_url", "")
+    base_url = get_secret("HERMES_BASE_URL", "") or cfg.get("base_url", "")
     sections = [
         {"title": "Model", "rows": [
             ["Model", _resolve_model()], ["Base URL", base_url or "(default)"], ["API Key", masked]]},
@@ -1001,7 +1003,7 @@ def _(rid, params: dict) -> dict:
             ["Max Turns", str(_cfg_max_turns(cfg, 500))],
             ["Toolsets", ", ".join(cfg.get("enabled_toolsets", [])) or "all"],
             ["Verbose", str(cfg.get("verbose", False))]]},
-        {"title": "Environment", "rows": [["Working Dir", os.getcwd()], ["Config File", str(_hermes_home / "config.yaml")]]},
+        {"title": "Environment", "rows": [["Working Dir", os.getcwd()], ["Config File", str(_active_config_path())]]},
     ]
     return _ok(rid, {"sections": sections})
 
@@ -1035,12 +1037,11 @@ def _(rid, params: dict) -> dict:
             return err
     # The client sends session_id, not profile; the live session is authoritative.
     home = (session or {}).get("profile_home")
-    scopes = _bind_build_profile_scopes(home) if home else None
+    scopes = _bind_build_profile_scopes(home)
     try:
         return _configure_session_tools(rid, params, sid, session)
     finally:
-        if scopes is not None:
-            _release_build_profile_scopes(scopes)
+        _release_build_profile_scopes(scopes)
 
 
 def _configure_session_tools(rid, params: dict, sid: str, session) -> dict:
@@ -1379,6 +1380,7 @@ def _plugin_rows() -> list[dict]:
     cat = _tools_mod("hermes_cli.plugins_cmd_catalog")
     enabled, disabled = pc._get_enabled_set(), pc._get_disabled_set()
     pins = cat.catalog_pins()  # powers the desktop's "Update to <pin>" affordance
+    versions = cat.catalog_versions()
     ref_pins = pc._read_install_metadata()  # ``--ref`` installs: pinned_sha so the desktop can show the pin
     out = []
     for name, version, desc, source, _dir, key in sorted(pc._discover_all_plugins()):
@@ -1396,7 +1398,7 @@ def _plugin_rows() -> list[dict]:
             "source": source, "status": status, "portable": pc._is_portable_plugin_dir(_dir),
             "install_dir": str(_dir_path) if _dir_path else "",
             "has_desktop_half": bool(_dir_path and (_dir_path / "desktop" / "plugin.js").is_file()),
-            **cat.catalog_row_fields(_dir, pins),
+            **cat.catalog_row_fields(_dir, pins, versions),
             **({"pinned_sha": sha} if (sha := pc.pinned_revision(name, ref_pins)) else {})})
     return out
 

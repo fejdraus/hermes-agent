@@ -1505,10 +1505,10 @@ export interface ProfilesCreateResult {
   model_set?: boolean
   mirrored: ProfileMirrored
 }
-/** What was copied from the launch profile; ``auth`` is ``"shared"`` under ``share_auth``. */
+/** What was copied from the launch profile. */
 export interface ProfileMirrored {
   env?: boolean
-  auth?: boolean | 'shared'
+  auth?: boolean
   model_inherited?: boolean
   voice?: boolean
 }
@@ -2523,6 +2523,8 @@ export interface InflightTurn {
   assistant?: string
   streaming?: boolean
   user?: string
+  display_kind?: string | null
+  display_metadata?: Record<string, unknown> | null
   corrections?: string[] | null
   correction_offsets?: number[] | null
   error?: string | null
@@ -2798,7 +2800,7 @@ export interface SessionContextBreakdownParams {
   session_id: string
   profile?: string | null
 }
-/** ``agent.context_breakdown.compute_session_context_breakdown`` (empty categories before the agent builds). */
+/** ``agent.context_breakdown.compute_session_context_breakdown`` (empty categories before the agent builds) plus the per-file context manifest (empty until the agent exists). */
 export interface SessionContextBreakdownResult {
   categories: ContextCategory[]
   context_max: number
@@ -2808,12 +2810,22 @@ export interface SessionContextBreakdownResult {
   context_estimated: boolean
   context_source: string
   model: string
+  context_files?: ContextFileSource[]
 }
 export interface ContextCategory {
   color: string
   id: string
   label: string
   tokens: number
+}
+/** One row of ``agent.context_file_sources.list_context_file_sources``. */
+export interface ContextFileSource {
+  label: string
+  path: string
+  chars: number
+  est_tokens: number
+  loaded: boolean
+  status: string
 }
 export interface SessionCompressParams {
   session_id: string
@@ -3523,7 +3535,7 @@ export interface McpServerRuntimeRow {
   disabled: boolean
   status: McpRuntimeStatus
 }
-export type McpRuntimeStatus = 'connected' | 'disabled' | 'connecting' | 'failed' | 'configured'
+export type McpRuntimeStatus = 'connected' | 'disabled' | 'connecting' | 'failed' | 'lazy' | 'configured'
 /** ``preset`` (catalog id) and/or ``config`` (url/command/args/env/headers/auth/tools); a ``bearer_token`` is written to the profile's .env, only the header template persists. */
 export interface McpServersAddParams {
   profile?: string | null
@@ -3671,6 +3683,7 @@ export interface AgentPluginRow {
   catalog_tier?: string | null
   installed_sha?: string | null
   catalog_sha?: string | null
+  catalog_version?: string | null
   update_available?: boolean | null
   pinned_sha?: string | null
 }
@@ -3828,6 +3841,9 @@ export interface SetupReadyPayload {
   has_identity: boolean
   other_providers: boolean
   error?: string
+  error_code?: string | null
+  retryable?: boolean | null
+  retry_after?: number | null
   finished_at: number
   [key: string]: unknown
 }

@@ -128,7 +128,7 @@ The agent-facing `cronjob` tool accepts the same action (`action=resnap job_id=<
 
 ## Skill-backed cron jobs
 
-A cron job can load one or more skills before it runs the prompt.
+A cron job can load one or more skills before it runs the prompt. Each skill loads exactly as it does from `/skill-name` in a chat session, including the `[Skill config ...]` block with its resolved `metadata.hermes.config` values from `config.yaml`.
 
 ### Single skill
 
@@ -263,6 +263,10 @@ What they do:
 
 **Name-based lookup.** All four mutating verbs (`pause`, `resume`, `run`, `remove`, `edit`) plus the agent's `cronjob` tool now accept a job **name** (case-insensitive) in place of the hex ID. The agent and CLI both prefer an exact ID match if one exists; ambiguous name matches (multiple jobs sharing the same name) are refused with the full list of candidate IDs so you can pick one explicitly. Names are not unique, so this guard is load-bearing — it prevents silently mutating the wrong job when two share a name.
 
+### Pausing everything: `hermes pause`
+
+`hermes pause [--reason ...]` is the global emergency stop (`hermes resume` lifts it). While it is engaged no scheduled cron fire starts, whichever door it arrives through: the built-in ticker skips its dispatch, the managed-cron (hosted scheduler) fire webhook answers `503` with `Retry-After: 60` so the scheduler redelivers the fire after you resume, and the [misfire catch-up](#misfire-catch-up) sweep stays idle instead of force-firing everything that was held back. Runs already in flight are never killed, and nothing is lost: due work catches up on the first tick or sweep after `hermes resume`. Explicit manual runs (`hermes cron run`, the dashboard's Trigger button) are an operator override and still execute while paused.
+
 ### Creating a job paused (safe canary)
 
 Create a canary without a create-then-pause scheduling race:
@@ -310,6 +314,14 @@ cadence, or run a "cron librarian" job that reconciles the whole table
   job delivers nowhere). A job created by a scheduled agent can never point
   its output at a session that no longer exists. Explicit targets
   (`local`, `all`, `telegram:<chat_id>`) are honored verbatim.
+- **A job may remove itself and still report.** The "watch for X, tell me
+  once, then stop" pattern — a recurring job whose run calls
+  `cronjob(action="remove", job_id=<its own id>)` and then answers — delivers
+  that final response and records the run as `completed`; the job record and
+  its `cron/output/<job_id>/` directory are gone afterwards and the final run
+  is not written there. Deleting the record from *outside* the run (another
+  process, or a replacement job reusing the id) still discards the stale
+  run's output, as before.
 
 Prefer prompts that update existing jobs (list first, then update by ID)
 over ones that create new jobs each run.
@@ -637,7 +649,7 @@ cron:
 
 Behaviour is **thread-preferred**, scoped to the job's own conversation:
 
-- **Thread-capable platforms** (Telegram topics, Discord/Slack threads): each
+- **Thread-capable platforms** (Telegram topics, Discord/Slack/Matrix threads): each
   delivery opens its own dedicated thread and the brief is seeded into that
   thread's session, so a reply in-thread continues with full context. A
   recurring job (e.g. a daily brief) opens a fresh thread per run, keeping each
@@ -736,6 +748,24 @@ Otherwise, report the issue.
 ```
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
+
+### Declaring a failed run
+
+Only runtime failures (exceptions, timeouts, an unreachable model) mark a run as failed. When the agent itself
+finishes its turn but the work did not get done — for example a delegated subagent or a script it ran failed —
+it can declare the run failed by putting `[CRON_FAILURE]` alone on the **first line** of its response, followed
+by the explanation:
+
+```text
+[CRON_FAILURE]
+The nightly export subagent exited with "disk full"; no report was produced.
+```
+
+The run is then recorded as failed (`last_status`, failure streak, `hermes cron runs` and `hermes cron incidents`
+all reflect it) and the failure notice is delivered like any other failed run. The full response is still saved
+under `~/.hermes/cron/output/` for triage. The marker is strict: mentioning or quoting `[CRON_FAILURE]` anywhere
+else in a report leaves the run successful. Script-only (`no_agent`) jobs ignore it — a script signals failure
+with a non-zero exit code.
 
 ## Script timeout
 
@@ -1100,7 +1130,9 @@ cronjob(action="create", name="weekly-news-summary",
         prompt="Summarize this week's AI news: ...")
 ```
 
-When `enabled_toolsets` is set on a job it wins; otherwise the `hermes tools` cron-platform config wins; otherwise Hermes falls back to the built-in defaults. This matters for cost control: carrying `browser`, `delegation` into every tiny "fetch news" job bloats the tool-schema prompt on every LLM call.
+When `enabled_toolsets` is set on a job it wins; otherwise the `hermes tools` cron-platform config wins; otherwise Hermes falls back to the built-in defaults. If the cron-platform toolset config cannot be read at all (for example a malformed `platform_toolsets` block in `config.yaml`), the run fails with a recorded error instead of quietly running with every tool — check `hermes cron list` / `hermes cron doctor`. This matters for cost control: carrying `browser`, `delegation` into every tiny "fetch news" job bloats the tool-schema prompt on every LLM call.
+
+If the job drives a site you're logged into, the login has to be in place before the run — a scheduled tick has nobody to answer a prompt. [Scheduled and unattended runs](./browser.md#scheduled-and-unattended-runs) covers that setup.
 
 ### Skipping the agent entirely: `wakeAgent`
 

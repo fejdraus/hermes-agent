@@ -34,7 +34,7 @@ class _Gateway:
     def __init__(self, adapter):
         self._adapter = adapter
 
-    def _adapter_for_source(self, source):
+    def _intake_adapter_for(self, source):
         return self._adapter
 
     def _reply_metadata(self, event):
@@ -64,7 +64,7 @@ def test_transport_failure_does_not_propagate(announce):
 
 def test_missing_adapter_is_tolerated(announce):
     class _NoAdapter(_Gateway):
-        def _adapter_for_source(self, source):
+        def _intake_adapter_for(self, source):
             return None
 
     asyncio.run(announce(_NoAdapter(None), object(), _Source()))

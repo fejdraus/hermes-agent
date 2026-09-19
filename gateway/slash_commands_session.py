@@ -528,7 +528,7 @@ class GatewaySessionCommandsMixin:
         long transcript. Without this the command looks dropped, which is how a three-minute wait
         reads in a chat window. Best-effort: a failed notice must not cost the compression itself.
         """
-        adapter = self._adapter_for_source(source)
+        adapter = self._intake_adapter_for(source)
         if adapter is None:
             return
         with contextlib.suppress(Exception):

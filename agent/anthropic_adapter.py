@@ -21,8 +21,7 @@ from agent.anthropic_endpoints import (
     _is_third_party_anthropic_endpoint, _model_name_is_kimi_family, _normalize_base_url_text,
     _requires_bearer_auth,
 )
-from agent.anthropic_message_convert import (  # noqa: F401
-    _video_source_from_openai_url,
+from agent.anthropic_message_convert import (
     convert_messages_to_anthropic, convert_tools_to_anthropic, normalize_model_name,
 )
 

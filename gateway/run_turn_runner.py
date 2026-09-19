@@ -1671,38 +1671,6 @@ class TurnRunner:
             logger.warning("Native image attachment failed, falling back to text: %s", exc)
         return ctx.message
 
-    def _attach_native_videos(self, run_message):
-        """Дописать отложенные видео к сообщению тем же multimodal-списком.
-
-        Идёт после ветки изображений, поэтому сообщение и с картинкой, и с
-        видео сохраняет один текстовый фрагмент и все вложения рядом с ним.
-        """
-        ctx = self._ctx
-        native_vids = self._runner._consume_pending_native_video_paths(ctx.session_key)
-        if not native_vids:
-            return run_message
-        try:
-            from agent.image_routing import build_native_video_parts, video_input_fps
-            try:
-                from hermes_cli.config import load_config as _load_cfg
-                fps = video_input_fps(_load_cfg())
-            except Exception:
-                fps = None
-            parts, skipped = build_native_video_parts(native_vids, fps)
-            if skipped:
-                logger.warning(
-                    "Native video attachment: skipped %d path(s) (unreadable or over size cap): %s",
-                    len(skipped), skipped,
-                )
-            if parts:
-                if isinstance(run_message, list):
-                    return list(run_message) + parts
-                text = str(run_message or "").strip()
-                return [{"type": "text", "text": text or "What is in this video?"}] + parts
-        except Exception as exc:
-            logger.warning("Native video attachment failed, falling back to text: %s", exc)
-        return run_message
-
     def _run_conversation_with_approval(self, agent, agent_history, observed_group_context,
                                         persist_user_message_override, persist_user_timestamp_override):
         """Run the turn with the per-session gateway approval callback registered: dangerous-command
@@ -1715,8 +1683,7 @@ class TurnRunner:
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
-            api_message = _wrap_current_message_with_observed_context(
-                self._attach_native_videos(self._native_image_run_message()), observed_group_context)
+            api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.

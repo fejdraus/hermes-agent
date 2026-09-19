@@ -178,34 +178,6 @@ def _image_source_from_openai_url(url: str) -> Dict[str, str]:
     return {"type": "url", "url": url}
 
 
-def _video_source_from_openai_url(url: str) -> Dict[str, str]:
-    """Convert an OpenAI-style ``video_url`` into an Anthropic video source.
-
-    MiniMax-M3 accepts video on the Anthropic-compatible endpoint as
-    ``{"type": "video", "source": {...}}`` — base64 up to 50 MB, or a plain
-    URL the provider fetches itself. Verified live against
-    ``api.minimax.io/anthropic/v1/messages``.
-    """
-    url = str(url or "").strip()
-    if not url:
-        return {"type": "url", "url": ""}
-
-    if url.startswith("data:"):
-        header, _, data = url.partition(",")
-        media_type = "video/mp4"
-        if header.startswith("data:"):
-            mime_part = header[len("data:"):].split(";", 1)[0].strip()
-            if mime_part.startswith("video/"):
-                media_type = mime_part
-        return {
-            "type": "base64",
-            "media_type": media_type,
-            "data": data,
-        }
-
-    return {"type": "url", "url": url}
-
-
 def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
     """Convert one OpenAI-style content part to an Anthropic block (None -> dropped)."""
     if part is None:
@@ -221,15 +193,6 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
         image_value = part.get("image_url", {})
         url = image_value.get("url", "") if isinstance(image_value, dict) else str(image_value or "")
         block = {"type": "image", "source": _image_source_from_openai_url(url)}
-    elif ptype in {"video_url", "input_video"}:
-        video_value = part.get("video_url", {})
-        if isinstance(video_value, dict):
-            url = video_value.get("url", "")
-        else:
-            url = str(video_value or "")
-        block = {"type": "video", "source": _video_source_from_openai_url(url)}
-        if isinstance(video_value, dict) and video_value.get("fps") is not None:
-            block["fps"] = video_value["fps"]
     else:
         block = dict(part)
     if (cache_control := _cache_control_of(part)) is not None:

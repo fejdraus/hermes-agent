@@ -61,9 +61,6 @@ class PersistentState:
     approvals: Optional[Dict[str, Any]] = None  # {"command": ..., "pattern_key": ...}
     update_prompt_pending: bool = False  # /update prompt awaiting a reply
     native_image_paths: List[str] = field(default_factory=list)  # consumed one-shot
-    # Video paths staged for inline attachment, same one-shot contract. Only
-    # filled when agent.video_input is on — see agent/image_routing.py.
-    native_video_paths: List[str] = field(default_factory=list)
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)

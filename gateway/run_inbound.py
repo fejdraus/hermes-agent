@@ -1765,20 +1765,6 @@ class GatewayInboundMixin:
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
-        if video_paths:
-            from agent.image_routing import video_input_enabled as _video_input_enabled
-            try:
-                from hermes_cli.config import load_config as _load_cfg
-                _cfg_for_video = _load_cfg()
-            except Exception:
-                _cfg_for_video = None
-            if _video_input_enabled(_cfg_for_video):
-                self._session_state(session_key).persistent.native_video_paths = list(video_paths)
-                logger.info(
-                    "Video routing: native (agent.video_input on). %d video(s) will be attached inline.",
-                    len(video_paths),
-                )
-                video_paths = []
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
         if "@" in message_text:
@@ -1807,14 +1793,6 @@ class GatewayInboundMixin:
             return (event.text or "").strip()
         _, successful_transcripts = await self._transcribe_pending_audio_event_once(event, "")
         return "\n\n".join(t.strip() for t in successful_transcripts if t.strip())
-
-    def _consume_pending_native_video_paths(self, session_key: str) -> List[str]:
-        """Забрать и очистить видео, отложенные для вложения в запрос."""
-        state = self._peek_session_state(session_key)
-        paths = list(state.persistent.native_video_paths or []) if state is not None else []
-        if paths:
-            state.persistent.native_video_paths = []
-        return paths
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         state = self._peek_session_state(session_key)

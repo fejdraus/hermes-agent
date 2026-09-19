@@ -604,9 +604,10 @@ class GatewayInboundMixin:
         # A burst of attachments arrives as near-simultaneous updates and is one intent: the user
         # selected several files and sent them. Interrupting the turn for the second file of the
         # same batch cancels the work the first one started — and with it the provider stream, which
-        # surfaces as a connection error rather than as anything the user would recognise. Bursts
-        # are absorbed by adapter-level batching instead. Voice is deliberately excluded: speech is
-        # how a user interrupts on purpose.
+        # surfaces as a connection error rather than as anything the user would recognise. Upstream
+        # lists PHOTO here because the adapter batches photos, albums and image-documents; a PDF
+        # report sent as several files has no such lane, so it is queued here instead. Voice is
+        # deliberately excluded: speech is how a user interrupts on purpose.
         if event.message_type in _ATTACHMENT_BURST_TYPES:
             logger.debug("PRIORITY attachment follow-up (%s) for session %s — queueing without interrupt",
                          event.message_type, _quick_key)

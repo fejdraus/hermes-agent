@@ -1,0 +1,6 @@
+name: cron-delivery-guard
+version: "1.0.0"
+description: "Jev (TypeSafe) checks a cron job's final response before delivery: working notes, reasoning and leaked internals are not sent; the paragraph addressed to the user is kept when there is one. Opt-in per profile: plugins.cron-delivery-guard.enabled: true and TYPESAFE_API_KEY in the profile's .env."
+author: fejdraus
+provides_hooks:
+  - transform_llm_output

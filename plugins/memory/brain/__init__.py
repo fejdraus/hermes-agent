@@ -22,6 +22,7 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       auto_store: true
       extract_model: mistral/mistral-large-latest
       recall_limit: 8
+      write_filter: jev               # optional: Jev types, dedups and gates new facts;
       recall_filter: jev              # optional: Jev (TypeSafe) filters recalled facts;
       recall_drop_below: 0.2          #   key TYPESAFE_API_KEY in the profile's .env
       recall_ledger_threshold: 0.4
@@ -127,6 +128,70 @@ _JEV_LEDGER_Q = ("The message is about how much of a food product is at home, wa
 _JEV_READING_Q = ("The fact states how much of a food product is or was at home — a stock or "
                   "remaining-quantity reading — even if it also mentions a rule. A norm, limit, "
                   "target or recipe amount alone is not a reading.")
+_JEV_DURABLE_Q = ("This fact is worth remembering long term: a stable fact about the user, their rules, "
+                  "preferences, health, possessions or the world that will still matter in months, not "
+                  "a one-off moment of a conversation.")
+_JEV_TYPE_Q = "Which relation type best describes this knowledge-graph fact?"
+_JEV_DUP_Q = ("Which existing fact states the same information as the new fact? Pick NEW if none of "
+              "them says the same thing.")
+_JEV_CONTRA_Q = "The new fact contradicts the chosen existing fact (they cannot both be true now)."
+FACT_TYPES = {
+    "is_a": "what something is, its kind or identity",
+    "property": "an attribute or characteristic of a thing",
+    "prefers": "the user likes or prefers something",
+    "dislikes": "the user dislikes or avoids something by taste",
+    "diet_rule": "a diet rule: what is allowed, required, combined or how much",
+    "forbidden": "something is banned or excluded (diet, medical)",
+    "health": "a medical fact: lab result, diagnosis, medication, symptom",
+    "measured": "a body measurement: weight, fat %, waist, BMI",
+    "ate": "the user ate or drank something (a consumption event)",
+    "bought": "a purchase event",
+    "plans": "a plan or intention: meal plan, what will be cooked or done",
+    "contains": "a composition: ingredient of a recipe, part of a set",
+    "owns": "the user owns an object, device, kitchen equipment",
+    "habit": "a routine, schedule or recurring behaviour",
+    "assistant_rule": "an instruction how the assistant must work or answer",
+    "person": "a relationship with or fact about another person",
+    "place": "where something or someone is",
+    "tech": "technical setup: servers, software, accounts, configs",
+    "event": "some other dated event",
+    "other": "none of the above",
+}
+_WRITE_DROP_BELOW = 0.15
+_DUP_MIN = 0.85
+_CONTRA_UPDATE = 0.7
+_JEV_WRITE_TIMEOUT = 20.0
+
+
+def jev_prob(a: Any) -> Optional[float]:
+    if not isinstance(a, dict):
+        return None
+    for k in ("noul", "probability", "value"):
+        v = a.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    return None
+
+
+def write_verdict(d: Dict[str, Any]) -> str:
+    """Рішення щодо нового факту за оцінками Jev: drop-transient | drop-reading | skip |
+    update | add.
+
+    Відкидається явне сміття (подія розмови, тестовий файл, звіт про запуск) і показання
+    залишку, яким володіє облік. Дубль не пишеться вдруге; старий факт переписується
+    лише коли новий йому прямо суперечить, — невпевнене «схоже» лишається новим записом,
+    бо стерти живий факт дорожче, ніж мати копію."""
+    if d.get("durable") is not None and d["durable"] < _WRITE_DROP_BELOW:
+        return "drop-transient"
+    if (d.get("reading") or 0.0) >= 0.5:
+        return "drop-reading"
+    if d.get("dup") and (d.get("dup_conf") or 0.0) >= _DUP_MIN:
+        contra = d.get("contra")
+        if contra is not None and contra >= _CONTRA_UPDATE:
+            return "update"
+        if contra is None or contra < 0.5:
+            return "skip"
+    return "add"
 
 
 def foreign_python_env() -> Dict[str, str]:
@@ -586,12 +651,15 @@ class BrainMemoryProvider(MemoryProvider):
         self._jev_timeout = float(self._config.get("jev_timeout") or _JEV_TIMEOUT)
         self._drop_below = float(self._config.get("recall_drop_below") or 0.2)
         self._ledger_threshold = float(self._config.get("recall_ledger_threshold") or 0.4)
-        self._jev_key = self._resolve_jev_key() if self._config.get("recall_filter") == "jev" else ""
-        self._jev_filter = bool(self._jev_key)
+        want_recall = self._config.get("recall_filter") == "jev"
+        want_write = self._config.get("write_filter") == "jev"
+        self._jev_key = self._resolve_jev_key() if (want_recall or want_write) else ""
+        self._jev_filter = bool(self._jev_key) and want_recall
+        self._jev_write = bool(self._jev_key) and want_write
         logger.info(
-            "brain graph memory: db=%s auto_store=%s extract_model=%s breath=%s recall_filter=%s",
-            self._db, self._auto_store, self._extract_model, self._breath_path,
-            "jev" if self._jev_filter else "off",
+            "brain graph memory: db=%s auto_store=%s extract_model=%s breath=%s recall_filter=%s "
+            "write_filter=%s", self._db, self._auto_store, self._extract_model, self._breath_path,
+            "jev" if self._jev_filter else "off", "jev" if self._jev_write else "off",
         )
 
     def _resolve_jev_key(self) -> str:
@@ -609,14 +677,23 @@ class BrainMemoryProvider(MemoryProvider):
                 return m.group(1)
         except OSError:
             pass
-        logger.warning("brain recall_filter=jev, but TYPESAFE_API_KEY not found in %s — filter off",
+        logger.warning("brain jev filter requested, but TYPESAFE_API_KEY not found in %s — filter off",
                        env_path)
         return ""
+
+    def _jev_request(self, state: str, questions: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        import urllib.request
+        body = json.dumps({"model": "jev-latest", "state": state[:4000],
+                           "questions": questions}).encode()
+        req = urllib.request.Request(_JEV_URL, data=body, headers={
+            "Authorization": f"Bearer {self._jev_key}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.load(r)
+        return resp.get("answers") or (resp.get("result") or {}).get("answers") or {}
 
     def _jev_scores(self, message: str, entries: List[Dict[str, Any]]) -> Optional[tuple]:
         """Оценки Jev: вероятность нужности для каждого факта и «сообщение о
         запасах». ``None`` при любом сбое — тогда вспоминание идёт как раньше."""
-        import urllib.request
         questions: Dict[str, Any] = {"ledger": {"type": "noul", "instructions": _JEV_LEDGER_Q}}
         for i, e in enumerate(entries):
             if "fact" in e:
@@ -624,32 +701,74 @@ class BrainMemoryProvider(MemoryProvider):
                     "question": _JEV_FACT_Q, "fact": fact_text(e)[:600]}}
                 questions[f"r{i}"] = {"type": "noul", "instructions": {
                     "question": _JEV_READING_Q, "fact": fact_text(e)[:600]}}
-        body = json.dumps({"model": "jev-latest", "state": message[:4000],
-                           "questions": questions}).encode()
-        req = urllib.request.Request(_JEV_URL, data=body, headers={
-            "Authorization": f"Bearer {self._jev_key}", "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=self._jev_timeout) as r:
-                resp = json.load(r)
+            answers = self._jev_request(message, questions, self._jev_timeout)
         except Exception as e:
             logger.info("brain recall filter: jev unavailable (%s) — unfiltered", e)
             return None
-        answers = resp.get("answers") or (resp.get("result") or {}).get("answers") or {}
-
-        def prob(a: Any) -> Optional[float]:
-            if not isinstance(a, dict):
-                return None
-            for k in ("noul", "probability", "value"):
-                v = a.get(k)
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    return float(v)
-            return None
-
         probs = {i: p for i in range(len(entries))
-                 if (p := prob(answers.get(f"f{i}"))) is not None}
+                 if (p := jev_prob(answers.get(f"f{i}"))) is not None}
         readings = {i: p for i in range(len(entries))
-                    if (p := prob(answers.get(f"r{i}"))) is not None}
-        return probs, prob(answers.get("ledger")) or 0.0, readings
+                    if (p := jev_prob(answers.get(f"r{i}"))) is not None}
+        return probs, jev_prob(answers.get("ledger")) or 0.0, readings
+
+    def _jev_write_scores(self, t: Dict[str, str]) -> Dict[str, Any]:
+        """Оцінки Jev для одного нового факту: тип зв'язку зі словника, довготривалість,
+        показання залишку й дубль/суперечність серед схожих наявних фактів. Кидає виняток
+        при збої мережі — тоді викликач повертається до звірки через LLM."""
+        text = f"{t.get('subject', '')} → {t.get('predicate', '')} → {t.get('object', '')}. {t.get('fact', '')}"
+        cands = dict(self._recall_candidates(str(t.get("fact", "")) or text))
+        qs: Dict[str, Any] = {
+            "type": {"type": "choice", "instructions": _JEV_TYPE_Q, "criteria": FACT_TYPES},
+            "durable": {"type": "noul", "instructions": _JEV_DURABLE_Q},
+            "reading": {"type": "noul", "instructions": _JEV_READING_Q},
+        }
+        if cands:
+            qs["dup"] = {"type": "choice", "instructions": _JEV_DUP_Q,
+                         "criteria": {**cands, "NEW": "none of these says the same thing"}}
+        a = self._jev_request(f"New fact: {text}", qs, _JEV_WRITE_TIMEOUT)
+        d: Dict[str, Any] = {
+            "type": (a.get("type") or {}).get("choice"),
+            "durable": jev_prob(a.get("durable")), "reading": jev_prob(a.get("reading")),
+            "dup": None, "dup_conf": None, "contra": None,
+        }
+        dup = (a.get("dup") or {}).get("choice")
+        if dup and dup != "NEW" and dup in cands:
+            d["dup"], d["dup_conf"] = dup, float((a.get("dup") or {}).get("confidence") or 0.0)
+            c = self._jev_request(f"New fact: {text}\nExisting fact: {cands[dup]}",
+                                  {"c": {"type": "noul", "instructions": _JEV_CONTRA_Q}},
+                                  _JEV_WRITE_TIMEOUT)
+            d["contra"] = jev_prob(c.get("c"))
+        return d
+
+    def _store_with_jev(self, triples: List[Dict[str, str]]) -> bool:
+        """Запис нових фактів за рішеннями Jev (див. ``write_verdict``). ``False`` — Jev
+        недоступний, нічого не записано; викликач робить звичайну звірку через LLM."""
+        try:
+            scored = [(t, self._jev_write_scores(t)) for t in triples]
+        except Exception as e:
+            logger.info("brain write filter: jev unavailable (%s) — LLM reconcile", e)
+            return False
+        for t, d in scored:
+            verdict = write_verdict(d)
+            fact = str(t.get("fact", "")).strip() or \
+                f"{t.get('subject', '')} {t.get('predicate', '')} {t.get('object', '')}"
+            logger.info("brain write filter: %s %r (type=%s durable=%s reading=%s dup=%s/%s contra=%s)",
+                        verdict, fact[:80], d["type"], d["durable"], d["reading"],
+                        d["dup"], d["dup_conf"], d["contra"])
+            if verdict.startswith("drop") or verdict == "skip":
+                continue
+            if verdict == "update":
+                try:
+                    self._run_cli(["update", "--id", d["dup"], "--content", fact, "-y"], _STORE_TIMEOUT)
+                    continue
+                except Exception as e:
+                    logger.warning("brain write filter: update %s failed (%s), adding instead", d["dup"], e)
+            if d["type"] and d["type"] != "other" and d["type"] != t.get("predicate"):
+                t = {**t, "predicate": d["type"],
+                     "context": f"{t.get('context', '')} [predicate: {t.get('predicate', '')}]".strip()}
+            self._store_triple(t)
+        return True
 
     def _load_plugin_config(self) -> Dict[str, Any]:
         try:
@@ -1072,7 +1191,8 @@ class BrainMemoryProvider(MemoryProvider):
                             t.get("subject"))
                 continue
             kept.append(t)
-        self._store_with_reconcile(kept)
+        if not (self._jev_write and kept and self._store_with_jev(kept)):
+            self._store_with_reconcile(kept)
         logger.info("brain breathe: %d turn(s) -> %d fact(s)", len(turns), len(kept))
         try:
             self._apply_ledger(period)

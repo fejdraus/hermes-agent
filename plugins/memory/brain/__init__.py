@@ -657,7 +657,12 @@ class BrainMemoryProvider(MemoryProvider):
                 capture_output=True, text=True, timeout=timeout,
                 env=env, cwd=self._cli_dir,
             )
-            return (proc.stdout or "").strip()
+            out = (proc.stdout or "").strip()
+            if proc.returncode != 0 or not out:
+                logger.warning("brain cli '%s' exit=%s, stdout=%d chars, stderr: %s",
+                               args[0] if args else "?", proc.returncode, len(out),
+                               (proc.stderr or "").strip()[-400:] or "-")
+            return out
         except subprocess.TimeoutExpired:
             logger.warning("brain cli '%s' timed out after %ss", args[0] if args else "?", timeout)
             return ""

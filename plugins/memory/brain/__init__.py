@@ -124,6 +124,9 @@ _JEV_FACT_Q = ("This remembered fact is needed to answer or act on the user's me
                "(it is about the same subject and changes or supports the reply).")
 _JEV_LEDGER_Q = ("The message is about how much of a food product is at home, was eaten, bought "
                  "or thrown away (quantities or stock).")
+_JEV_READING_Q = ("The fact states how much of a food product is or was at home — a stock or "
+                  "remaining-quantity reading — even if it also mentions a rule. A norm, limit, "
+                  "target or recipe amount alone is not a reading.")
 
 
 def foreign_python_env() -> Dict[str, str]:
@@ -162,15 +165,22 @@ def fact_text(entry: Dict[str, Any]) -> str:
 
 
 def filter_recall(entries: List[Dict[str, Any]], probs: Dict[int, float], ledger_p: float,
-                  ledger_stems: set, drop_below: float, ledger_threshold: float) -> List[Dict[str, Any]]:
+                  ledger_stems: set, drop_below: float, ledger_threshold: float,
+                  readings: Optional[Dict[int, float]] = None) -> List[Dict[str, Any]]:
     """Отбор припомненного по оценкам Jev.
 
     Отсекается только явный шум: у Jev вероятности сжаты, нужные факты получают
     0,4–0,7, поэтому порог «оставлять уверенное» выбросил бы нужное, а порог
     снизу — нет. Если сообщение о запасах, из графа убираются показания
-    количеств по учётным продуктам: число берётся из сводки учёта, а не из
-    старой записи (та же граница, что и при записи — ``ledger_owned``)."""
+    количеств: число берётся из сводки учёта, а не из старой записи.
+
+    Показание ли это, решает вопрос Jev: регулярка ``ledger_owned`` ошибается в
+    обе стороны — пропускает показание, смешанное с правилом («422 г зараз; з
+    кефіром заборонено»), и режет прошлый план покупки («2 пачки по 340 г»),
+    который остатком не является. Регулярка — только запасной вариант, когда
+    у факта нет оценки."""
     about_stock = ledger_p >= ledger_threshold
+    readings = readings or {}
     kept: List[Dict[str, Any]] = []
     for i, e in enumerate(entries):
         if "header" in e:
@@ -179,8 +189,12 @@ def filter_recall(entries: List[Dict[str, Any]], probs: Dict[int, float], ledger
         p = probs.get(i)
         if p is not None and p < drop_below:
             continue
-        if about_stock and ledger_owned({"fact": fact_text(e)}, ledger_stems):
-            continue
+        if about_stock:
+            r = readings.get(i)
+            is_reading = (r >= 0.5 if r is not None
+                          else ledger_owned({"fact": fact_text(e)}, ledger_stems))
+            if is_reading:
+                continue
         kept.append(e)
     return [e for j, e in enumerate(kept)
             if "fact" in e or any("fact" in n for n in kept[j + 1:j + 2])]
@@ -608,6 +622,8 @@ class BrainMemoryProvider(MemoryProvider):
             if "fact" in e:
                 questions[f"f{i}"] = {"type": "noul", "instructions": {
                     "question": _JEV_FACT_Q, "fact": fact_text(e)[:600]}}
+                questions[f"r{i}"] = {"type": "noul", "instructions": {
+                    "question": _JEV_READING_Q, "fact": fact_text(e)[:600]}}
         body = json.dumps({"model": "jev-latest", "state": message[:4000],
                            "questions": questions}).encode()
         req = urllib.request.Request(_JEV_URL, data=body, headers={
@@ -631,7 +647,9 @@ class BrainMemoryProvider(MemoryProvider):
 
         probs = {i: p for i in range(len(entries))
                  if (p := prob(answers.get(f"f{i}"))) is not None}
-        return probs, prob(answers.get("ledger")) or 0.0
+        readings = {i: p for i in range(len(entries))
+                    if (p := prob(answers.get(f"r{i}"))) is not None}
+        return probs, prob(answers.get("ledger")) or 0.0, readings
 
     def _load_plugin_config(self) -> Dict[str, Any]:
         try:
@@ -964,10 +982,10 @@ class BrainMemoryProvider(MemoryProvider):
         if self._jev_filter and any("fact" in e for e in entries):
             scored = self._jev_scores(query, entries)
             if scored is not None:
-                probs, ledger_p = scored
+                probs, ledger_p, readings = scored
                 total = sum(1 for e in entries if "fact" in e)
                 entries = filter_recall(entries, probs, ledger_p, self._ledger_stems(),
-                                        self._drop_below, self._ledger_threshold)
+                                        self._drop_below, self._ledger_threshold, readings)
                 logger.info("brain recall filter: kept %d/%d facts, stock=%.2f",
                             sum(1 for e in entries if "fact" in e), total, ledger_p)
         return render_recall(entries, self._recall_limit * 3)

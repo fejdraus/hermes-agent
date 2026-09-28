@@ -126,6 +126,19 @@ _JEV_LEDGER_Q = ("The message is about how much of a food product is at home, wa
                  "or thrown away (quantities or stock).")
 
 
+def foreign_python_env() -> Dict[str, str]:
+    """Окружение для интерпретатора brain (свой venv, своя версия Python).
+
+    Bootstrap hermes кладёт в ``os.environ`` ``PYTHONPATH`` к site-packages своего
+    окружения, чтобы их находили его собственные дочерние процессы. Чужой venv с
+    этим путём первым берёт оттуда пакеты другой версии Python и падает на
+    C-расширениях (asyncpg), поэтому путь не наследуется."""
+    env = dict(os.environ)
+    for var in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        env.pop(var, None)
+    return env
+
+
 def parse_recall(raw: str) -> List[Dict[str, Any]]:
     """Вывод ``cli.py recall`` → список записей: заголовки секций и факты с их
     строками-продолжениями, в исходном порядке."""
@@ -649,7 +662,7 @@ class BrainMemoryProvider(MemoryProvider):
 
 
     def _run_cli(self, args: List[str], timeout: float) -> str:
-        env = dict(os.environ)
+        env = foreign_python_env()
         env["BRAIN_DB"] = self._db
         try:
             proc = subprocess.run(
@@ -661,7 +674,7 @@ class BrainMemoryProvider(MemoryProvider):
             if proc.returncode != 0 or not out:
                 logger.warning("brain cli '%s' exit=%s, stdout=%d chars, stderr: %s",
                                args[0] if args else "?", proc.returncode, len(out),
-                               (proc.stderr or "").strip()[-400:] or "-")
+                               ((proc.stderr or "").strip().splitlines() or ["-"])[-1][:300])
             return out
         except subprocess.TimeoutExpired:
             logger.warning("brain cli '%s' timed out after %ss", args[0] if args else "?", timeout)
@@ -795,7 +808,8 @@ class BrainMemoryProvider(MemoryProvider):
             return False, "no ledger"
         try:
             proc = subprocess.run([self._python, script, *args],
-                                  capture_output=True, text=True, timeout=40.0)
+                                  capture_output=True, text=True, timeout=40.0,
+                                  env=foreign_python_env())
             out = ((proc.stdout or "") + (proc.stderr or "")).strip()
             return proc.returncode == 0, out
         except Exception as e:
@@ -927,7 +941,8 @@ class BrainMemoryProvider(MemoryProvider):
             return self._pantry_cache
         try:
             proc = subprocess.run([self._python, script, "brief"],
-                                  capture_output=True, text=True, timeout=25.0)
+                                  capture_output=True, text=True, timeout=25.0,
+                                  env=foreign_python_env())
             body = (proc.stdout or "").strip()
         except Exception as e:
             logger.warning("brain pantry brief failed: %s", e)

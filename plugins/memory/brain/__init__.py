@@ -22,6 +22,10 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       auto_store: true
       extract_model: mistral/mistral-large-latest
       recall_limit: 8
+      recall_filter: jev              # optional: Jev (TypeSafe) filters recalled facts;
+      recall_drop_below: 0.2          #   key TYPESAFE_API_KEY in the profile's .env
+      recall_ledger_threshold: 0.4
+      jev_timeout: 1.5
 """
 
 from __future__ import annotations
@@ -115,6 +119,73 @@ def ledger_owned(triple: Dict[str, str], ledger_stems: set) -> bool:
     return bool(stems(claimed) & ledger_stems)
 
 
+_JEV_URL = "https://api.typesafe.ai/v1/systemone"
+_JEV_FACT_Q = ("This remembered fact is needed to answer or act on the user's message correctly "
+               "(it is about the same subject and changes or supports the reply).")
+_JEV_LEDGER_Q = ("The message is about how much of a food product is at home, was eaten, bought "
+                 "or thrown away (quantities or stock).")
+
+
+def parse_recall(raw: str) -> List[Dict[str, Any]]:
+    """Вывод ``cli.py recall`` → список записей: заголовки секций и факты с их
+    строками-продолжениями, в исходном порядке."""
+    entries: List[Dict[str, Any]] = []
+    for line in (raw or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("🧠"):
+            continue
+        if s.startswith("--") and s.endswith("--"):
+            entries.append({"header": s.strip("- ").strip()})
+        elif s.startswith("[") or (s.startswith("- ") and entries):
+            entries.append({"fact": s if s.startswith("- ") else "- " + s, "more": []})
+        elif entries and "fact" in entries[-1]:
+            entries[-1]["more"].append(s)
+    return entries
+
+
+def fact_text(entry: Dict[str, Any]) -> str:
+    head = re.sub(r"^- (?:\[[0-9a-f]+\]\s*)?(?:\[[\d.]+\]\s*)?", "", entry["fact"])
+    return " ".join([head, *entry["more"]]).strip()
+
+
+def filter_recall(entries: List[Dict[str, Any]], probs: Dict[int, float], ledger_p: float,
+                  ledger_stems: set, drop_below: float, ledger_threshold: float) -> List[Dict[str, Any]]:
+    """Отбор припомненного по оценкам Jev.
+
+    Отсекается только явный шум: у Jev вероятности сжаты, нужные факты получают
+    0,4–0,7, поэтому порог «оставлять уверенное» выбросил бы нужное, а порог
+    снизу — нет. Если сообщение о запасах, из графа убираются показания
+    количеств по учётным продуктам: число берётся из сводки учёта, а не из
+    старой записи (та же граница, что и при записи — ``ledger_owned``)."""
+    about_stock = ledger_p >= ledger_threshold
+    kept: List[Dict[str, Any]] = []
+    for i, e in enumerate(entries):
+        if "header" in e:
+            kept.append(e)
+            continue
+        p = probs.get(i)
+        if p is not None and p < drop_below:
+            continue
+        if about_stock and ledger_owned({"fact": fact_text(e)}, ledger_stems):
+            continue
+        kept.append(e)
+    return [e for j, e in enumerate(kept)
+            if "fact" in e or any("fact" in n for n in kept[j + 1:j + 2])]
+
+
+def render_recall(entries: List[Dict[str, Any]], limit_lines: int) -> str:
+    lines: List[str] = []
+    for e in entries:
+        if "header" in e:
+            lines.append(e["header"])
+        else:
+            lines.append(e["fact"])
+            lines.extend("  " + m for m in e["more"])
+        if len(lines) >= limit_lines:
+            break
+    return "## Brain Graph\n" + "\n".join(lines) if any("fact" in e for e in entries) else ""
+
+
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
@@ -171,6 +242,7 @@ _EXTRACT_TIMEOUT = 60.0
 _PREFETCH_WAIT = 6.0
 _LEDGER_TTL = 600.0
 _PANTRY_TTL = 300.0
+_JEV_TIMEOUT = 1.5
 
 BRAIN_GRAPH_SCHEMA: Dict[str, Any] = {
     "name": "brain_graph",
@@ -451,6 +523,11 @@ class BrainMemoryProvider(MemoryProvider):
         self._ledger_at: float = 0.0
         self._pantry_cache: str = ""
         self._pantry_at: float = 0.0
+        self._jev_filter: bool = False
+        self._jev_key: str = ""
+        self._jev_timeout: float = _JEV_TIMEOUT
+        self._drop_below: float = 0.2
+        self._ledger_threshold: float = 0.4
 
 
     @property
@@ -479,10 +556,69 @@ class BrainMemoryProvider(MemoryProvider):
         self._llm_base_url, self._llm_api_key = self._resolve_llm()
         _home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
         self._breath_path = os.path.join(_home, f"brain_breath_{self._db}.jsonl")
+        self._jev_timeout = float(self._config.get("jev_timeout") or _JEV_TIMEOUT)
+        self._drop_below = float(self._config.get("recall_drop_below") or 0.2)
+        self._ledger_threshold = float(self._config.get("recall_ledger_threshold") or 0.4)
+        self._jev_key = self._resolve_jev_key() if self._config.get("recall_filter") == "jev" else ""
+        self._jev_filter = bool(self._jev_key)
         logger.info(
-            "brain graph memory: db=%s auto_store=%s extract_model=%s breath=%s",
+            "brain graph memory: db=%s auto_store=%s extract_model=%s breath=%s recall_filter=%s",
             self._db, self._auto_store, self._extract_model, self._breath_path,
+            "jev" if self._jev_filter else "off",
         )
+
+    def _resolve_jev_key(self) -> str:
+        """Ключ TypeSafe из ``.env`` своего профиля: в мультиплексном шлюзе
+        окружение процесса общее для всех профилей, файл — нет."""
+        try:
+            from hermes_cli.config import get_hermes_home
+            env_path = os.path.join(str(get_hermes_home()), ".env")
+        except Exception:
+            env_path = os.path.join(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"), ".env")
+        try:
+            with open(env_path, encoding="utf-8") as fh:
+                m = re.search(r"^TYPESAFE_API_KEY=[\"']?([^\"'\s]+)", fh.read(), re.M)
+            if m:
+                return m.group(1)
+        except OSError:
+            pass
+        logger.warning("brain recall_filter=jev, but TYPESAFE_API_KEY not found in %s — filter off",
+                       env_path)
+        return ""
+
+    def _jev_scores(self, message: str, entries: List[Dict[str, Any]]) -> Optional[tuple]:
+        """Оценки Jev: вероятность нужности для каждого факта и «сообщение о
+        запасах». ``None`` при любом сбое — тогда вспоминание идёт как раньше."""
+        import urllib.request
+        questions: Dict[str, Any] = {"ledger": {"type": "noul", "instructions": _JEV_LEDGER_Q}}
+        for i, e in enumerate(entries):
+            if "fact" in e:
+                questions[f"f{i}"] = {"type": "noul", "instructions": {
+                    "question": _JEV_FACT_Q, "fact": fact_text(e)[:600]}}
+        body = json.dumps({"model": "jev-latest", "state": message[:4000],
+                           "questions": questions}).encode()
+        req = urllib.request.Request(_JEV_URL, data=body, headers={
+            "Authorization": f"Bearer {self._jev_key}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self._jev_timeout) as r:
+                resp = json.load(r)
+        except Exception as e:
+            logger.info("brain recall filter: jev unavailable (%s) — unfiltered", e)
+            return None
+        answers = resp.get("answers") or (resp.get("result") or {}).get("answers") or {}
+
+        def prob(a: Any) -> Optional[float]:
+            if not isinstance(a, dict):
+                return None
+            for k in ("noul", "probability", "value"):
+                v = a.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    return float(v)
+            return None
+
+        probs = {i: p for i in range(len(entries))
+                 if (p := prob(answers.get(f"f{i}"))) is not None}
+        return probs, prob(answers.get("ledger")) or 0.0
 
     def _load_plugin_config(self) -> Dict[str, Any]:
         try:
@@ -804,21 +940,17 @@ class BrainMemoryProvider(MemoryProvider):
         raw = self._run_cli(["recall", query], _RECALL_TIMEOUT)
         if not raw or "No matching facts" in raw:
             return ""
-        lines: List[str] = []
-        for line in raw.splitlines():
-            s = line.strip()
-            if not s or s.startswith("🧠"):
-                continue
-            if s.startswith("--") and s.endswith("--"):
-                lines.append(s.strip("- ").strip())
-                continue
-            if s.startswith("["):
-                lines.append("- " + s)
-            elif lines:
-                lines.append("  " + s)
-            if len(lines) >= self._recall_limit * 3:
-                break
-        return "## Brain Graph\n" + "\n".join(lines) if lines else ""
+        entries = parse_recall(raw)
+        if self._jev_filter and any("fact" in e for e in entries):
+            scored = self._jev_scores(query, entries)
+            if scored is not None:
+                probs, ledger_p = scored
+                total = sum(1 for e in entries if "fact" in e)
+                entries = filter_recall(entries, probs, ledger_p, self._ledger_stems(),
+                                        self._drop_below, self._ledger_threshold)
+                logger.info("brain recall filter: kept %d/%d facts, stock=%.2f",
+                            sum(1 for e in entries if "fact" in e), total, ledger_p)
+        return render_recall(entries, self._recall_limit * 3)
 
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:

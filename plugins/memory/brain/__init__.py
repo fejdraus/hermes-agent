@@ -132,6 +132,8 @@ _JEV_DURABLE_Q = ("This fact is worth remembering long term: a stable fact about
                   "preferences, health, possessions or the world that will still matter in months, not "
                   "a one-off moment of a conversation.")
 _JEV_TYPE_Q = "Which relation type best describes this knowledge-graph fact?"
+_JEV_HAPPENED_Q = ("The quote says the user has already done this action (it happened), not that they plan, "
+                   "want, might or were advised to do it, and not a question.")
 _JEV_DUP_Q = ("Which existing fact states the same information as the new fact? Pick NEW if none of "
               "them says the same thing.")
 _JEV_CONTRA_Q = "The new fact contradicts the chosen existing fact (they cannot both be true now)."
@@ -994,6 +996,7 @@ class BrainMemoryProvider(MemoryProvider):
             return
         haystack = period.lower()
         digits = {_digit_key(m) for m in _PRECISE_TOKEN.findall(period)}
+        pending: List[tuple] = []
         for mv in data.get("moves") or []:
             op = str(mv.get("op", "")).strip().lower()
             product = str(mv.get("product", "")).strip()
@@ -1024,6 +1027,8 @@ class BrainMemoryProvider(MemoryProvider):
                     args += ["--slot", slot]
                 if day in LEDGER_DAYS:
                     args += ["--date", day]
+            pending.append((op, product, qty, str(mv.get("quote", "")).strip(), args))
+        for op, product, qty, quote, args in self._happened(pending):
             ok, out = self._run_inventory(args)
             logger.info("brain ledger: %s %s %s -> %s", op, product, qty,
                         "ok" if ok else out[:160])
@@ -1051,6 +1056,33 @@ class BrainMemoryProvider(MemoryProvider):
                     args += [flag, val]
             ok, out = self._run_inventory(args)
             logger.info("brain ledger: recipe %r -> %s", name, "ok" if ok else out[:160])
+
+    def _happened(self, pending: List[tuple]) -> List[tuple]:
+        """Лише рухи, чия цитата каже про вже скоєне, а не про план, бажання чи питання.
+
+        Модель вилучення вміє відрізняти намір від факту, але помилка тут коштує полиці:
+        «завтра з'їм курку» списує курку, якої ніхто не їв. Тож перед записом Jev окремо
+        оцінює кожну цитату; без ключа Jev або при збої рухи йдуть як раніше."""
+        if not pending or not self._jev_key:
+            return pending
+        verbs = {"ate": "ate or drank", "use": "used in cooking", "bought": "bought", "spoil": "threw away"}
+        qs = {f"h{i}": {"type": "noul", "instructions": {
+            "question": _JEV_HAPPENED_Q, "action": f"{verbs.get(op, op)} {product}", "quote": quote[:400]}}
+            for i, (op, product, _q, quote, _a) in enumerate(pending)}
+        try:
+            answers = self._jev_request("Food ledger moves extracted from a chat.", qs, _JEV_WRITE_TIMEOUT)
+        except Exception as e:
+            logger.info("brain ledger: jev unavailable (%s) — moves applied unchecked", e)
+            return pending
+        kept = []
+        for i, mv in enumerate(pending):
+            p = jev_prob(answers.get(f"h{i}"))
+            if p is not None and p < 0.5:
+                logger.info("brain ledger: dropped %s %r — quote is not something that happened (%.2f)",
+                            mv[0], mv[1], p)
+                continue
+            kept.append(mv)
+        return kept
 
     def _llm_payload(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         """Тело запроса к модели извлечения.

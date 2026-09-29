@@ -157,6 +157,10 @@ FACT_TYPES = {
     "event": "some other dated event",
     "other": "none of the above",
 }
+LEDGER_FACT_TYPES = ("ate", "bought")
+LEDGER_OPS = ("ate", "use", "bought", "spoil")
+MEAL_SLOTS = ("breakfast", "lunch", "snack", "dinner", "extra")
+LEDGER_DAYS = ("today", "yesterday")
 _WRITE_DROP_BELOW = 0.15
 _DUP_MIN = 0.85
 _CONTRA_UPDATE = 0.7
@@ -173,18 +177,23 @@ def jev_prob(a: Any) -> Optional[float]:
     return None
 
 
-def write_verdict(d: Dict[str, Any]) -> str:
-    """Рішення щодо нового факту за оцінками Jev: drop-transient | drop-reading | skip |
-    update | add.
+def write_verdict(d: Dict[str, Any], ledger_types: tuple = ()) -> str:
+    """Рішення щодо нового факту за оцінками Jev: drop-transient | drop-reading |
+    drop-ledger | skip | update | add.
 
     Відкидається явне сміття (подія розмови, тестовий файл, звіт про запуск) і показання
-    залишку, яким володіє облік. Дубль не пишеться вдруге; старий факт переписується
-    лише коли новий йому прямо суперечить, — невпевнене «схоже» лишається новим записом,
-    бо стерти живий факт дорожче, ніж мати копію."""
+    залишку, яким володіє облік. Подія з ``ledger_types`` (з'їв, купив) теж не йде в граф,
+    коли в профілю є облік: вона вже записана там точно, а в графі стає застарілим
+    дублем. Довготривале в такій події (купив гриль — тепер він є) лишається.
+    Дубль не пишеться вдруге; старий факт переписується лише коли новий йому прямо
+    суперечить, — невпевнене «схоже» лишається новим записом, бо стерти живий факт
+    дорожче, ніж мати копію."""
     if d.get("durable") is not None and d["durable"] < _WRITE_DROP_BELOW:
         return "drop-transient"
     if (d.get("reading") or 0.0) >= 0.5:
         return "drop-reading"
+    if d.get("type") in ledger_types and (d.get("durable") or 0.0) < 0.5:
+        return "drop-ledger"
     if d.get("dup") and (d.get("dup_conf") or 0.0) >= _DUP_MIN:
         contra = d.get("contra")
         if contra is not None and contra >= _CONTRA_UPDATE:
@@ -489,13 +498,19 @@ must record. The ledger is a physical inventory: what was eaten, bought, or thro
 and recipes worth keeping.
 
 Return ONLY a JSON object, no prose:
-{"moves": [{"op": "use|bought|spoil", "product": "...", "qty": <number>, "unit": "г|мл|шт",
+{"moves": [{"op": "ate|use|bought|spoil", "product": "...", "qty": <number>,
+            "unit": "г|мл|шт|порц", "slot": "breakfast|lunch|snack|dinner|extra|",
+            "day": "today|yesterday",
             "quote": "the exact sentence from the conversation that states it"}],
  "recipes": [{"name": "...", "ingredients": [{"product": "...", "qty": <number>}],
               "servings": <number>, "instructions": "1. ... 2. ...", "source": "..."}]}
 
 MOVES — record ONLY what already happened:
-- "use" — eaten or cooked; "bought" — brought home (a receipt line); "spoil" — thrown away.
+- "ate" — the user ate or drank it: a single food or a whole dish, one move per item.
+  "porц" only when the user counted portions of a dish. "slot" only when the meal was
+  named (empty otherwise); "day" is "yesterday" only when the user said so.
+- "use" — went into cooking without being eaten directly; "bought" — brought home (a
+  receipt line); "spoil" — thrown away.
 - The user must have STATED it. Intent, plans, suggestions, menus for tomorrow, and
   questions ("what should I cook?", "I'll have chicken later") are NOT moves.
 - The quantity must be stated in the conversation. Never estimate a portion yourself,
@@ -749,8 +764,9 @@ class BrainMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.info("brain write filter: jev unavailable (%s) — LLM reconcile", e)
             return False
+        ledger_types = LEDGER_FACT_TYPES if self._inventory_script() else ()
         for t, d in scored:
-            verdict = write_verdict(d)
+            verdict = write_verdict(d, ledger_types)
             fact = str(t.get("fact", "")).strip() or \
                 f"{t.get('subject', '')} {t.get('predicate', '')} {t.get('object', '')}"
             logger.info("brain write filter: %s %r (type=%s durable=%s reading=%s dup=%s/%s contra=%s)",
@@ -982,7 +998,7 @@ class BrainMemoryProvider(MemoryProvider):
             op = str(mv.get("op", "")).strip().lower()
             product = str(mv.get("product", "")).strip()
             quote = str(mv.get("quote", "")).strip().lower()
-            if op not in ("use", "bought", "spoil") or not product:
+            if op not in LEDGER_OPS or not product:
                 continue
             try:
                 qty = float(str(mv.get("qty")).replace(",", "."))
@@ -1001,6 +1017,13 @@ class BrainMemoryProvider(MemoryProvider):
                 continue
             unit = str(mv.get("unit") or "").strip()
             args = [op, product, str(qty)] + ([unit] if unit else []) + ["--once"]
+            if op == "ate":
+                slot = str(mv.get("slot") or "").strip().lower()
+                day = str(mv.get("day") or "").strip().lower()
+                if slot in MEAL_SLOTS:
+                    args += ["--slot", slot]
+                if day in LEDGER_DAYS:
+                    args += ["--date", day]
             ok, out = self._run_inventory(args)
             logger.info("brain ledger: %s %s %s -> %s", op, product, qty,
                         "ok" if ok else out[:160])

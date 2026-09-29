@@ -1,0 +1,8 @@
+name: ledger-number-guard
+version: "1.0.0"
+description: "Marks a reply that states food calories, portion weights or stock as fact without a ledger call in the same turn: Jev (TypeSafe) decides whether the numbers are the assistant's own claims, and a short footer asks the user to have them checked. Opt-in per profile: plugins.ledger-number-guard.enabled: true and TYPESAFE_API_KEY in the profile's .env."
+author: fejdraus
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
+  - transform_llm_output

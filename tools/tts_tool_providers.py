@@ -400,9 +400,8 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     base_url = runtime.endpoint
     # MiniMax scopes TTS requests by GroupId (``?GroupId=<id>`` on the t2a_v2 URL): config or
     # MINIMAX_GROUP_ID, attached only when absent from the URL.
-    from hermes_cli.config import get_env_value
     group_id = (str(mm_config.get("group_id") or "").strip()
-                or (get_env_value("MINIMAX_GROUP_ID") or "").strip())
+                or str(_origin()._resolve_provider_key("MINIMAX_GROUP_ID", "") or "").strip())
     if group_id and "GroupId=" not in base_url:
         base_url = f"{base_url}{'&' if '?' in base_url else '?'}GroupId={group_id}"
     is_t2a_v2 = "t2a_v2" in base_url

@@ -212,6 +212,12 @@ def _flood_cap_result(wait: float) -> SendResult:
     return SendResult(success=False, error=f"flood_control:{wait}", retry_after=float(wait))
 
 
+def _inline_flags_for(event: MessageEvent) -> list[Optional[bool]]:
+    """One ``media_text_inlined`` flag per media item, unknown ones as ``None``, so merged albums stay aligned."""
+    flags = list(event.media_text_inlined or [])
+    return flags + [None] * (len(event.media_urls) - len(flags))
+
+
 _TELEGRAM_IMAGE_MIME_TO_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 _TELEGRAM_IMAGE_EXT_TO_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
 
@@ -6654,6 +6660,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if existing is None:
             pending[key] = event
             return
+        if event.media_urls:
+            existing.media_text_inlined = _inline_flags_for(existing) + _inline_flags_for(event)
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
         if event.text:

@@ -530,3 +530,37 @@ class TestHoldInboundAcrossReconnect:
         await adapter._redispatch_held_inbound()
         held_texts = [e.text for e in adapter._held_inbound_events]
         assert held_texts == ["boom", "after"]
+
+
+def _document_event(path: str, inlined: bool) -> MessageEvent:
+    event = _make_event("")
+    event.message_type = MessageType.DOCUMENT
+    event.media_urls = [path]
+    event.media_types = ["application/pdf"]
+    event.media_text_inlined = [inlined]
+    return event
+
+
+class TestDocumentAlbum:
+    def test_album_of_documents_keeps_one_inline_flag_per_file(self):
+        from gateway.session_envelope import _media_clause
+
+        adapter = _make_adapter()
+        adapter._merge_into_pending(adapter._media_group_events, "album", _document_event("/a.pdf", False))
+        adapter._merge_into_pending(adapter._media_group_events, "album", _document_event("/b.txt", True))
+
+        merged = adapter._media_group_events["album"]
+        assert merged.media_urls == ["/a.pdf", "/b.txt"]
+        assert merged.media_text_inlined == [False, True]
+        assert _media_clause(merged) is None
+
+    def test_photo_without_flags_after_a_document_gets_an_unknown_flag(self):
+        adapter = _make_adapter()
+        adapter._merge_into_pending(adapter._media_group_events, "album", _document_event("/a.pdf", False))
+        photo = _make_event("")
+        photo.message_type = MessageType.PHOTO
+        photo.media_urls = ["/p.jpg"]
+        photo.media_types = ["image/jpeg"]
+        adapter._merge_into_pending(adapter._media_group_events, "album", photo)
+
+        assert adapter._media_group_events["album"].media_text_inlined == [False, None]

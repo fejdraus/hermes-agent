@@ -21,7 +21,7 @@ brain работает не как MCP-инструмент, а как `MemoryPr
 
 Хранилище — AlloyDB Omni на порту **5433**, отдельная БД на бота: `paul_brain`,
 `fury_brain`, `bibi_brain`. CLI и доступ к БД — общие с nanobot-ботами:
-`/home/dietpi/clawd/brain/cli.py` (пароль брать из `cli.DB_CONFIG`, не хардкодить).
+`/home/dietpi/brain/cli.py` (пароль брать из `cli.DB_CONFIG`, не хардкодить).
 
 ## Инвентарь локальных правок
 
@@ -48,33 +48,14 @@ Upstream позволяет только ОДИН внешний провайд�
 
 ### 3. Правки общего brain CLI
 
-`/home/dietpi/clawd/brain/cli.py` — вне hermes, но от него зависит:
+`/home/dietpi/brain/cli.py` — вне hermes, но от него зависит:
 
 - сетевой эмбеддер **mistral-embed (1024 измерения)** через OmniRoute для БД из
   `_OMNIROUTE_BRAINS` (строка ~48); ключ из env `OMNIROUTE_API_KEY` или файла
-  `/home/dietpi/clawd/brain/.omniroute_key` (chmod 600, в `.gitignore`);
+  `/home/dietpi/brain/.omniroute_key` (chmod 600, в `.gitignore`);
 - неинтерактивные `delete`/`update` (флаги `-y/--force`, `--id`, `--content`);
   интерактивная версия вынесена в `_cmd_update_interactive`;
 - `--force` удаляет **только при точном совпадении** `content`, иначе печатает id-кандидатов.
-
-### 3b. Хранилище mem0 — СЕРВЕРНЫЙ Qdrant, не встроенный (с 27.07.2026)
-
-`mem0.json` каждого профиля указывает на `"url": "http://127.0.0.1:6333"` — это
-контейнер `qdrant` (bind-том `/mnt/data_disk/qdrant`, `restart: unless-stopped`),
-поднятый владельцем сервера ещё в мае для индексации заметок и сессий. Коллекции
-разделены по именам: наши — `paul_mem0` / `fury_mem0` / `bibi_mem0` (1024 измерения),
-чужие — `memory` / `sessions` (768). **Не удалять чужие.**
-
-Почему не встроенный режим (`"path": …`): встроенный Qdrant — однопользовательская
-файловая база. Второй клиент в том же процессе получает
-`Storage folder … is already accessed by another instance`, провайдер запоминает
-ошибку в `_init_error` и **на всю сессию** отдаёт её вместо работы — все `mem0_add` /
-`mem0_search` / `mem0_update` мертвы до перезапуска, молча, без единой ошибки в чате.
-Ловилось 14.07, 17.07 и 27.07.
-
-Старые встроенные каталоги (`~/.hermes/mem0_qdrant`, `…/profiles/fury/mem0_qdrant`)
-намеренно НЕ удалены — это путь отката: вернуть `"path"` вместо `"url"` в `mem0.json`.
-Бэкапы конфигов: `mem0.json.bak-qdrantserver-*`.
 
 ### 4. Конфиги (по профилю)
 
@@ -84,7 +65,7 @@ memory:
 plugins:
   hermes-brain:
     brain_db: paul_brain       # fury_brain / bibi_brain
-    cli_dir: /home/dietpi/clawd/brain
+    cli_dir: /home/dietpi/brain
     auto_store: true
     extract_model: minimax/MiniMax-M3
     recall_limit: 8
@@ -130,10 +111,10 @@ ls -l plugins/memory/brain/__init__.py
 grep -n "provider:" ~/.hermes/config.yaml ~/.hermes/profiles/*/config.yaml | grep -i memory -A0
 ```
 
-**Шаг 4. Прогнать тест качества извлечения** — `/home/dietpi/clawd/brain/test_prompt_v4.py`:
+**Шаг 4. Прогнать тест качества извлечения** — `/home/dietpi/brain/test_prompt_v4.py`:
 
 ```bash
-cd /home/dietpi/.hermes && ./hermes-agent/venv/bin/python /home/dietpi/clawd/brain/test_prompt_v4.py
+cd /home/dietpi/.hermes && ./hermes-agent/venv/bin/python /home/dietpi/brain/test_prompt_v4.py
 ```
 
 Ожидается «промпт v4 работает»: два кейса-провала дают 0 триплетов, контрольный — ≥5 верных.
@@ -214,7 +195,7 @@ SKILL.md» — это поломка; нормальный дифф со стр�
 9. **Не убирать защиту от самопетель** в `_store_triple` (`subject == object` →
    `"skipped self-loop"`). Правило есть и в промпте, но код-страховка не зависит от
    послушности модели.
-10. **Не трогать `/home/dietpi/clawd/brain/cli.py` без оглядки на nanobot** — этот файл
+10. **Не трогать `/home/dietpi/brain/cli.py` без оглядки на nanobot** — этот файл
    общий с ботами thufir/leto/wysd/creatio. `creatio_brain` намеренно остался на локальном
    Ollama `nomic-embed-text` (768), остальные — на mistral-embed (1024). Список в
    `_OMNIROUTE_BRAINS`; новую БД бота надо добавлять туда же.

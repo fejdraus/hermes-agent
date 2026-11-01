@@ -12,13 +12,13 @@ empty for months). The MemoryProvider hooks are mandatory:
 * ``sync_turn``  — every turn is distilled into triples and written back
 * tools          — explicit traversal (neighbors / path / communities)
 
-Backend: /home/dietpi/clawd/brain/cli.py (Postgres + pgvector, per-bot database).
+Backend: /home/dietpi/brain/cli.py (Postgres + pgvector, per-bot database).
 
 Config in $HERMES_HOME/config.yaml (profile-scoped):
   plugins:
     hermes-brain:
       brain_db: paul_brain
-      cli_dir: /home/dietpi/clawd/brain
+      cli_dir: /home/dietpi/brain
       auto_store: true
       extract_model: mistral/mistral-large-latest
       recall_limit: 8
@@ -336,7 +336,7 @@ def json_from_reply(text: str, *, array: bool = False) -> Any:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CLI_DIR = "/home/dietpi/clawd/brain"
+_DEFAULT_CLI_DIR = "/home/dietpi/brain"
 _DEFAULT_DB = "paul_brain"
 _DEFAULT_EXTRACT_MODEL = "minimax/MiniMax-M3"
 _RECALL_TIMEOUT = 20.0

@@ -14,7 +14,7 @@ MCP tools are opt-in and the model ignores them. MemoryProvider hooks are mandat
 plugins:
   hermes-brain:
     brain_db: paul_brain
-    cli_dir: /home/dietpi/clawd/brain
+    cli_dir: /home/dietpi/brain
     auto_store: true
     extract_model: mistral/mistral-large-latest
     recall_limit: 8

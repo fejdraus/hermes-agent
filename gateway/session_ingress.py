@@ -1,8 +1,9 @@
 """Trusted messaging admission and the existing TurnRunner invocation boundary."""
 import asyncio
 import logging
+import os
 from contextvars import ContextVar
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import replace
 
 from gateway.platforms.event import MessageEvent
@@ -416,11 +417,32 @@ async def deliver_response(adapter, event, session_key, response):
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
     results = []
+    await _play_auto_tts(adapter, event, session_key, extracted, metadata, results.append)
     if extracted.text_content:
         await adapter._send_final_text(event, session_key, extracted.text_content,
                                        metadata, ttl > 0, ttl, results.append)
     await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
                                        record_delivery=results.append)
+
+
+async def _play_auto_tts(adapter, event, session_key, extracted, metadata, record_delivery):
+    """Voice the reply to a voice note that queued behind a running turn, as the first message's
+    lifecycle (``_process_message_background``) voices its own. The text still goes through the
+    ledgered send that follows, so the voice carries no caption."""
+    if not adapter._wants_auto_tts(event, session_key, asyncio.Event(), extracted.text_content,
+                                   extracted.media_files):
+        return
+    paths, requested_path = await adapter._synthesize_auto_tts(extracted.text_content)
+    for path in paths:
+        try:
+            record_delivery(await adapter.play_tts(
+                chat_id=event.source.chat_id, audio_path=path, caption=None, metadata=metadata))
+        finally:
+            with suppress(OSError):
+                os.remove(path)
+    if not paths and requested_path is not None:
+        with suppress(OSError):
+            os.remove(requested_path)
 
 
 async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):

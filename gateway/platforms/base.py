@@ -4118,6 +4118,8 @@ class BasePlatformAdapter(ABC):
                 speech_text = self.prepare_tts_text(text_content)
                 if not speech_text:
                     raise ValueError("Empty text after markdown cleanup")
+                if re.search(r"[0-9]", speech_text):
+                    logger.info("[%s] Auto-TTS reply still has digits; the model ignored the spoken-reply note", self.name)
                 requested_path = build_auto_tts_output_path(self.platform)
                 tts_data = _json.loads(await asyncio.to_thread(
                     text_to_speech_tool, text=speech_text, output_path=requested_path))

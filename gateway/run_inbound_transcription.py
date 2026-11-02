@@ -7,10 +7,14 @@ import logging
 import os
 from typing import Optional
 
+from gateway.platforms.event import MessageType
 from gateway.run_common import _UNSET
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+_SPOKEN_REPLY_NOTE = ("[This reply will be read aloud: write numbers, dates, decimals and units as words "
+                      "in the correct grammatical form, no digits.]")
 
 
 class GatewayInboundTranscriptionMixin:
@@ -66,6 +70,16 @@ class GatewayInboundTranscriptionMixin:
             user_text = self._prepend_media_prefix("\n\n".join(enriched_parts), user_text)
         return user_text, successful_transcripts
 
+    def _note_spoken_reply(self, event, text: str, transcripts: list[str]) -> str:
+        """A voice note the gateway will answer with auto-TTS: the model is told its reply is spoken,
+        so it writes numbers as words (it cannot know otherwise; the voicing happens after it)."""
+        if not transcripts or getattr(event, "message_type", None) != MessageType.VOICE:
+            return text
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None or not adapter._should_auto_tts_for_chat(event.source.chat_id):
+            return text
+        return f"{text}\n\n{_SPOKEN_REPLY_NOTE}"
+
     def _pending_event_audio_paths(self, event) -> list[str]:
         """Return STT-eligible paths from a pending voice message."""
         from gateway.run import _event_media_is_stt_input
@@ -101,6 +115,7 @@ class GatewayInboundTranscriptionMixin:
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths, clip_memo,
             )
+        enriched_text = self._note_spoken_reply(event, enriched_text, successful_transcripts)
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
         return enriched_text, successful_transcripts

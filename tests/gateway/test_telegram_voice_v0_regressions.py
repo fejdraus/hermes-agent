@@ -124,7 +124,7 @@ def _run_agent_runner(adapter):
 
 @pytest.mark.asyncio
 async def test_pending_voice_interrupt_reuses_transcript_and_echo():
-    adapter = SimpleNamespace(send=AsyncMock())
+    adapter = SimpleNamespace(send=AsyncMock(), _should_auto_tts_for_chat=lambda _chat_id: False)
     runner = _runner(adapter)
     source = _source()
     event = MessageEvent(

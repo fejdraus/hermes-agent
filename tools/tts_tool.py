@@ -736,6 +736,23 @@ def _tts_schema_overrides() -> dict:
 _CONFIGURED_VOICE_SENTENCE = "Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected."
 _ELEVENLABS_VOICE_SENTENCE = "The provider is user-configured (ElevenLabs); pick a voice per call with voice_id, found with find_voices (one character per voice, e.g. for game NPCs)."
 
+_DIGIT_RE = re.compile(r"[0-9]")
+
+
+def _model_text_to_speech(args: dict[str, Any], **_kw: Any) -> str:
+    """The model's call: its text must already be spoken words, so digits send it back to rewrite
+    them (a TTS engine reads "3 ноября" or "5,6" without the grammar of the sentence)."""
+    text = args.get("text", "") or ""
+    if args.get("find_voices") is None and _DIGIT_RE.search(text):
+        return tool_error(
+            "The text contains digits. Rewrite every number, date, decimal, ordinal and unit as words "
+            "in the correct grammatical form of the sentence, then call text_to_speech again.",
+            success=False)
+    return text_to_speech_tool(
+        text=text,
+        **{k: args.get(k) for k in ("output_path", "speed", "instructions", "voice_id", "find_voices", "language")})
+
+
 TTS_SCHEMA = {
     "name": "text_to_speech",
     "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. " + _CONFIGURED_VOICE_SENTENCE,
@@ -744,7 +761,7 @@ TTS_SCHEMA = {
         "properties": {
             "text": {
                 "type": "string",
-                "description": "The text to convert to speech. Provider-specific per-request character caps apply automatically (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k depending on model); longer input is split into ordered chunks without silent truncation."
+                "description": "The text to convert to speech, written exactly as it is to be spoken: every number, date, decimal, ordinal and unit as words in the correct grammatical form (e.g. \"третьего ноября\", \"пять целых шесть десятых градуса\"), no digits. Provider-specific per-request character caps apply automatically (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k depending on model); longer input is split into ordered chunks without silent truncation."
             },
             "output_path": {
                 "type": "string",
@@ -772,9 +789,7 @@ registry.register(
     name="text_to_speech",
     toolset="tts",
     schema=TTS_SCHEMA,
-    handler=lambda args, **kw: text_to_speech_tool(
-        text=args.get("text", ""),
-        **{k: args.get(k) for k in ("output_path", "speed", "instructions", "voice_id", "find_voices", "language")}),
+    handler=_model_text_to_speech,
     check_fn=check_tts_requirements,
     emoji="🔊",
     dynamic_schema_overrides=_tts_schema_overrides)

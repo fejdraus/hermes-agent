@@ -1550,7 +1550,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if _echo_adapter:
                 _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                 await self._echo_stt_transcripts(_echo_adapter, source, _successful_transcripts, metadata=_echo_meta)
-        return message_text
+        return self._note_spoken_reply(event, message_text, _successful_transcripts)
 
     @staticmethod
     def _inbound_attachment_display_name(path: str) -> tuple[str, str]:

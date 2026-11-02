@@ -245,6 +245,7 @@ fal = ["fal-client==0.14.1"]
 # Edge TTS — default TTS provider but still optional (users can pick
 # ElevenLabs / OpenAI / MiniMax instead).
 edge-tts = ["edge-tts==7.3.1"]
+lang-detect = ["lingua-language-detector==2.2.0; sys_platform != 'android'"]
 # NeuTTS's upstream Python ceiling excludes the managed interpreter.
 # Keep dependency markers and PM gates together: bundles omit them, explicit
 # setup requests report unavailable rather than succeeding with an empty set.

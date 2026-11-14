@@ -792,4 +792,5 @@ registry.register(
     handler=_model_text_to_speech,
     check_fn=check_tts_requirements,
     emoji="🔊",
+    compat_args=("voice_id", "find_voices"),  # advertised per provider; find_voices needs no text
     dynamic_schema_overrides=_tts_schema_overrides)

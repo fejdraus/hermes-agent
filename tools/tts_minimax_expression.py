@@ -1,10 +1,12 @@
-"""Expressive MiniMax speech (``speech-2.8-*``): an emotion per call, sound tags and stress marks
-on Russian homographs.
+"""Expressive MiniMax speech (``speech-2.8-*``): emotions, sound tags and stress marks on Russian
+homographs.
 
-The model that writes the reply picks the ``emotion`` of ``text_to_speech`` and writes the sound
-tags into the text; without an emotion MiniMax picks one from the text. Stress marks come from
-ruaccent (``tts_ru_stress``), never from a language model. Older MiniMax models would read the
-tags aloud, so all of this applies only to 2.8."""
+The model that writes the reply knows it will be spoken (``spoken_reply_note``) and marks the
+emotion of each part, ``[[sad]] ... [[happy]] ...``, and the sounds, ``(sighs)``; each part is
+then spoken with its own emotion, and the user reads the reply without the marks
+(``strip_voice_marks``). Without a mark MiniMax picks the emotion from the text. Stress marks
+come from ruaccent (``tts_ru_stress``), never from a language model. Older MiniMax models would
+read the marks aloud, so all of this applies only to 2.8."""
 
 from __future__ import annotations
 
@@ -31,14 +33,6 @@ EMOTION_SCHEMA = {
         "when unsure: the voice then picks one from the text."),
 }
 
-TEXT_GUIDANCE = (
-    " Make the voice sound alive: put a sound tag where a person would make that sound, e.g. "
-    "\"(sighs) Ну вот, опять дождь. (laughs) Зато поливать не надо.\" Tags: "
-    + ", ".join(f"({tag})" for tag in SOUND_TAGS)
-    + ". Use them rarely and only where the meaning calls for it, never as decoration. Do not "
-    "write stress marks: they are added for you.")
-
-
 def is_expressive(tts_config: dict[str, Any], provider: str) -> bool:
     """True when the active MiniMax model speaks sound tags and takes the 2.8 emotions."""
     if provider != "minimax":
@@ -55,6 +49,50 @@ def apply_emotion(tts_config: dict[str, Any], provider: str, emotion: Optional[s
     section = dict(tts_config.get("minimax") or {})
     section["emotion"] = emotion
     return {**tts_config, "minimax": section}
+
+
+_EMOTION_MARK_RE = re.compile(r"\[\[\s*(" + "|".join(EMOTIONS) + r")\s*\]\]\s*", re.IGNORECASE)
+
+VOICE_TEXT_RULES = (
+    "write it to be listened to: numbers, dates, times, decimals and units as words in the "
+    "grammatical form the sentence needs; connected speech without lists, headings, emoji, links "
+    "or markdown. Mark the emotion of each part with [[emotion]] at its start, one of "
+    + ", ".join(EMOTIONS) + ", and mark it again where the mood changes; leave a part unmarked "
+    "and the voice picks its emotion. Where a person would make a sound, rarely and only where "
+    "the meaning calls for it, write it: " + ", ".join(f"({tag})" for tag in SOUND_TAGS)
+    + ". Stress and the voice are added for you.")
+
+SPOKEN_REPLY_NOTE = (
+    "[The text of your reply will be turned into speech and sent as a voice message, so "
+    + VOICE_TEXT_RULES + " The marks are removed from the text the user reads.]")
+
+TEXT_GUIDANCE = " For a voice, " + VOICE_TEXT_RULES
+
+
+def emotion_segments(text: str) -> list[tuple[Optional[str], str]]:
+    """The reply cut at its ``[[emotion]]`` marks: ``(emotion or None, part)`` in order."""
+    parts: list[tuple[Optional[str], str]] = []
+    emotion, start = None, 0
+    for mark in _EMOTION_MARK_RE.finditer(text):
+        if text[start:mark.start()].strip():
+            parts.append((emotion, text[start:mark.start()].strip()))
+        emotion, start = mark.group(1).lower(), mark.end()
+    if text[start:].strip():
+        parts.append((emotion, text[start:].strip()))
+    return parts
+
+
+def strip_voice_marks(text: str) -> str:
+    """The reply as the user reads it: without ``[[emotion]]`` marks and sound tags."""
+    return _SOUND_TAG_RE.sub("", _EMOTION_MARK_RE.sub("", text))
+
+
+def spoken_reply_note() -> Optional[str]:
+    """The note on a voice message the gateway will answer by voice, for a 2.8 voice; ``None``
+    keeps the gateway's plain note."""
+    from tools.tts_tool import _get_provider, _load_tts_config
+    tts_config = _load_tts_config()
+    return SPOKEN_REPLY_NOTE if is_expressive(tts_config, _get_provider(tts_config)) else None
 
 
 def strip_sound_tags(text: str) -> str:

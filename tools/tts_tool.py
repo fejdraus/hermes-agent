@@ -496,6 +496,7 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: 
     Every touched path lands in *generated_artifacts* for the caller's sweep. Raises
     :class:`_ChunkFailed` on a reported failure, ``RuntimeError`` on garbage or missing audio."""
     provider = single_kwargs["provider"]
+    chunk_configs = single_kwargs.pop("chunk_configs", None) or [single_kwargs["tts_config"]] * len(chunks)
     encoded_paths: list[str] = []
     chunk_results: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks, start=1):
@@ -507,7 +508,7 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: 
             # nor sweep it; on success the delivery step os.replace()s the audio over it (overwrite).
             chunk_path = chunk_path.with_name(f".{chunk_path.stem}.{uuid.uuid4().hex}{chunk_path.suffix}")
         generated_artifacts.add(str(chunk_path))
-        raw_result = _text_to_speech_single(chunk, str(chunk_path), **single_kwargs)
+        raw_result = _text_to_speech_single(chunk, str(chunk_path), **{**single_kwargs, "tts_config": chunk_configs[index - 1]})
         try:
             chunk_result = json.loads(raw_result)
         except (json.JSONDecodeError, TypeError):
@@ -522,6 +523,15 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: 
         encoded_paths.append(actual_path)
         chunk_results.append(chunk_result)
     return encoded_paths, chunk_results
+
+
+def _clean_spoken(text: str) -> str:
+    """Shared cleaner: markdown, emoji, think blocks, verifier footer, units, newlines."""
+    try:
+        from tools.tts_text_normalize import prepare_spoken_text
+        return prepare_spoken_text(text, max_chars=None)
+    except Exception:
+        return text.strip()
 
 
 def text_to_speech_tool(
@@ -539,23 +549,27 @@ def text_to_speech_tool(
         return _find_voices(find_voices)
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
-    try:  # shared cleaner: markdown, emoji, think blocks, verifier footer, units, newlines
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
-    except Exception:
-        text = text.strip()
-    if not text:
-        return tool_error("Text is empty after TTS cleanup", success=False)
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
     tts_config, error = _apply_voice_override(tts_config, provider, voice_id)
     if error:
         return error
+    segments = emotion_segments(text) if is_expressive(tts_config, provider) else [(None, text)]
+    segments = [(mark, _clean_spoken(part)) for mark, part in segments]
+    segments = [(mark, part) for mark, part in segments if part]
+    if not segments:
+        return tool_error("Text is empty after TTS cleanup", success=False)
+    text = " ".join(part for _, part in segments)
     tts_config = _apply_language_voice(tts_config, provider, text, language)
     tts_config = apply_emotion(tts_config, provider, emotion)
-    text = apply_stress(text, tts_config, provider, language)
+    stressed = apply_stress("\n".join(part for _, part in segments), tts_config, provider, language).split("\n")
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
-    chunks = _split_text_for_tts(text, max_len)
+    chunks: list[str] = []
+    chunk_configs: list[dict[str, Any]] = []
+    for (mark, _), part in zip(segments, stressed):
+        part_chunks = _split_text_for_tts(part, max_len)
+        chunks += part_chunks
+        chunk_configs += [apply_emotion(tts_config, provider, mark) if mark else tts_config] * len(part_chunks)
     if not chunks:
         return tool_error("Text is required", success=False)
     if len(chunks) > 1:
@@ -571,7 +585,7 @@ def text_to_speech_tool(
     final_paths: list[str] = []
     try:
         encoded_paths, chunk_results = _synthesize_chunks(
-            chunks, base_path, generated_artifacts, provider=provider, tts_config=tts_config,
+            chunks, base_path, generated_artifacts, chunk_configs=chunk_configs, provider=provider, tts_config=tts_config,
             command_provider_config=command_provider_config, want_opus=want_opus,
             instructions=instructions)
         voice_compatible = bool(chunk_results) and all(bool(r.get("voice_compatible")) for r in chunk_results)
@@ -705,7 +719,8 @@ def check_tts_requirements() -> bool:
 
 # --- Registry ---
 from tools.registry import registry, tool_error
-from tools.tts_minimax_expression import EMOTION_SCHEMA, TEXT_GUIDANCE, apply_emotion, apply_stress, is_expressive
+from tools.tts_minimax_expression import (
+    EMOTION_SCHEMA, TEXT_GUIDANCE, apply_emotion, apply_stress, emotion_segments, is_expressive)
 
 def _output_path_description(home: str) -> str:
     return f"Optional custom file path to save the audio. Defaults to {home}/audio_cache/<timestamp>.mp3"

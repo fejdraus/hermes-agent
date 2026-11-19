@@ -104,3 +104,30 @@ def test_homograph_stress_follows_the_chosen_reading_and_replaces_guessed_marks(
     with patch("tools.tts_ru_stress._load", return_value=engine):
         spoken = tts_ru_stress.stress_homographs("В Замке ключ от за́мка, кури́ца.")
     assert spoken == "В За́мке ключ от замка́, курица."
+
+
+def test_each_marked_part_is_spoken_with_its_own_emotion(tmp_path):
+    reply = "[[sad]] Ковалев стоял у ворот. [[happy]] (laughs) А бабушка смеялась!"
+    seen = _speak(tmp_path, _config("speech-2.8-hd", None), reply, language="ru")
+    assert [(e, s) for e, _, s in seen] == [
+        ("sad", "Ковалев стоял у ворот."), ("happy", "(laughs) А бабушка смеялась!")]
+
+
+def test_an_unmarked_reply_leaves_the_emotion_to_the_voice(tmp_path):
+    seen = _speak(tmp_path, _config("speech-2.8-hd", None), "Ковалев стоял у ворот.", language="ru")
+    assert [(e, s) for e, _, s in seen] == [(None, "Ковалев стоял у ворот.")]
+
+
+def test_the_user_reads_the_reply_without_voice_marks():
+    from tools.tts_minimax_expression import strip_voice_marks
+    assert strip_voice_marks("[[sad]] Ковалев стоял. [[happy]] (laughs) Бабушка смеялась!") == \
+        "Ковалев стоял. Бабушка смеялась!"
+
+
+def test_the_spoken_reply_note_asks_for_marks_only_for_a_2_8_voice():
+    from tools.tts_minimax_expression import spoken_reply_note
+    with patch("tools.tts_tool._load_tts_config", return_value=_config("speech-2.8-hd")):
+        note = spoken_reply_note()
+    assert "[[emotion]]" in note and "(sighs)" in note and "as words" in note
+    with patch("tools.tts_tool._load_tts_config", return_value=_config("speech-02-hd")):
+        assert spoken_reply_note() is None

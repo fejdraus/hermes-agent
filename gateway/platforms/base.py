@@ -4406,6 +4406,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
                     _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content, event.source)
+                from tools.tts_minimax_expression import strip_voice_marks
+                text_content = strip_voice_marks(text_content)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):

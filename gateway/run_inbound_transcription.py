@@ -217,7 +217,8 @@ class GatewayInboundTranscriptionMixin:
         adapter = self._delivery_adapter_for(event.source)
         if adapter is None or not adapter._should_auto_tts_for_chat(event.source.chat_id):
             return text
-        return f"{text}\n\n{_SPOKEN_REPLY_NOTE}"
+        from tools.tts_minimax_expression import spoken_reply_note
+        return f"{text}\n\n{spoken_reply_note() or _SPOKEN_REPLY_NOTE}"
 
     async def _enrich_inbound_voice(
         self, event, source, message_text: str, audio_paths: list[str]

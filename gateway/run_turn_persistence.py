@@ -794,6 +794,9 @@ class GatewayTurnPersistenceMixin:
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
             await self._send_voice_reply(event, response)
+        if response:
+            from tools.tts_minimax_expression import strip_voice_marks
+            response = strip_voice_marks(response)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.

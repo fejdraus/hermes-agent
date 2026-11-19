@@ -1,4 +1,4 @@
-"""Stress marks on Russian homographs (за́мок / замо́к), chosen from the sentence by ruaccent.
+"""Stress marks on Russian homographs (за\u0301мок / замо\u0301к), chosen from the sentence by ruaccent.
 
 Only the homograph model and its word list are loaded (about 0.5 GB of memory), not ruaccent's
 full stress dictionary (about 2 GB): the voice already stresses ordinary words right, it is the
@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-STRESS = "́"
+STRESS = "\u0301"
 REPO = "ruaccent/accentuator"
 MODEL = "nn/nn_omograph/turbo3.1"
 MODEL_FILES = ("model.onnx", "config.json", "tokenizer.json", "tokenizer_config.json",

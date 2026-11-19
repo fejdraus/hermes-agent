@@ -28,7 +28,7 @@ def _speak(tmp_path, config, text, **kwargs):
 
     with patch("tools.tts_tool._generate_minimax_tts", side_effect=_fake_minimax), \
          patch("tools.tts_tool._load_tts_config", return_value=config), \
-         patch("tools.tts_ru_stress.stress_homographs", side_effect=lambda t: t.replace("замке", "за́мке")):
+         patch("tools.tts_ru_stress.stress_homographs", side_effect=lambda t: t.replace("замке", "за\u0301мке")):
         result = json.loads(tts_tool.text_to_speech_tool(text, output_path=str(tmp_path / "a.mp3"), **kwargs))
     assert result["success"]
     return seen
@@ -64,7 +64,7 @@ def test_sound_tags_do_not_change_the_voice_of_the_language(tmp_path):
 
 
 @pytest.mark.parametrize("model, language, spoken", [
-    ("speech-2.8-hd", "ru", "Встреча в за́мке."),
+    ("speech-2.8-hd", "ru", "Встреча в за\u0301мке."),
     ("speech-2.8-hd", "en", "Встреча в замке."),
     ("speech-02-hd", "ru", "Встреча в замке."),
 ])
@@ -81,16 +81,18 @@ def test_homograph_stress_follows_the_chosen_reading_and_replaces_guessed_marks(
 
     engine = (_Model(), {"замке": ["з+амке", "замк+е"], "замка": ["з+амка", "замк+а"]})
     with patch("tools.tts_ru_stress._load", return_value=engine):
-        spoken = tts_ru_stress.stress_homographs("В Замке ключ от за́мка, кури́ца.")
-    assert spoken == "В За́мке ключ от замка́, курица."
+        spoken = tts_ru_stress.stress_homographs("В Замке ключ от за\u0301мка, кури\u0301ца.")
+    assert spoken == "В За\u0301мке ключ от замка\u0301, курица."
 
 
-def _auto_voice(model, reply_text, rewritten):
+def _auto_voice(model, reply_text, rewritten, prompts=None):
     from gateway.platforms import base_auto_tts
 
     calls = []
 
-    def _fake_llm(**_kwargs):
+    def _fake_llm(**kwargs):
+        if prompts is not None:
+            prompts.append(kwargs["messages"][0]["content"])
         message = SimpleNamespace(content=rewritten)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
@@ -136,6 +138,16 @@ def test_an_auto_voice_rewrite_with_other_numbers_is_not_spoken(marked):
 def test_an_auto_voice_rewrite_that_changed_the_words_is_not_spoken(rewritten):
     reply = "Есть курица и рис, могу предложить плов."
     assert _auto_voice("speech-2.8-hd", reply, rewritten) == [(reply, None)]
+
+
+def test_a_reply_with_numbers_in_words_keeps_them_and_gets_its_emotion():
+    reply = "Двадцать первого ноября в семь утра шёл дождь."
+    spoken = "(sighs) Двадцать первого ноября в семь утра шёл дождь."
+    prompts = []
+    assert _auto_voice("speech-2.8-hd", reply, "sad\n" + spoken, prompts) == [(spoken, "sad")]
+    assert "{{" not in prompts[0]
+    _auto_voice("speech-2.8-hd", "В 7:05 шёл дождь.", "sad\nВ {{7:05|time}} шёл дождь.", prompts)
+    assert "{{value|form}}" in prompts[1]
 
 
 def test_the_first_line_of_the_rewrite_is_never_spoken():

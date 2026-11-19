@@ -89,12 +89,15 @@ _WORDS_PER_NUMBER = 6
 _EXTRA_WORDS = 3
 
 
-def _rewrite_prompt() -> str:
+def _rewrite_prompt(with_digits: bool) -> str:
+    """The rewrite instructions; the number marks are asked for only when the reply has digits,
+    since a model asked for marks also turns numbers already written as words into marks."""
     from tools.tts_number_words import MARKUP_GUIDE
+    numbers = MARKUP_GUIDE if with_digits else "Numbers are already words: leave them exactly as they are."
     return (
         "You prepare a chat reply to be spoken by a MiniMax speech-2.8 voice. Return the same "
         "text with only these changes:\n"
-        "- " + MARKUP_GUIDE + "\n"
+        "- " + numbers + "\n"
         "- A sound tag where a person would make that sound, rarely and only where the meaning "
         "calls for it: " + ", ".join(f"({tag})" for tag in SOUND_TAGS) + ".\n"
         "Keep every other word, its order and the meaning; do not shorten, add or explain "
@@ -104,7 +107,7 @@ def _rewrite_prompt() -> str:
 
 
 def _words(text: str) -> list[str]:
-    return [word.lower() for word in _WORD_RE.findall(strip_sound_tags(text).replace("́", ""))]
+    return [word.lower() for word in _WORD_RE.findall(strip_sound_tags(text).replace("\u0301", ""))]
 
 
 def keeps_the_text(original: str, rewritten: str) -> bool:
@@ -143,15 +146,16 @@ def rewrite_for_voice(text: str) -> tuple[str, Optional[str]]:
         from pm import ensure_import
         ensure_import("ru-voice")
         from agent.auxiliary_client import call_llm
-        from tools.tts_number_words import render_numbers
+        from tools.tts_number_words import number_values, render_numbers
         from tools.tts_tool_providers import _auxiliary_reply_text
         from tools.tts_voice_language import detect_language
         response = call_llm(
             task=REWRITE_TASK, temperature=0.3, max_tokens=len(text) * 3 + 200,
             extra_body={"thinking": {"type": "disabled"}},
-            messages=[{"role": "system", "content": _rewrite_prompt()}, {"role": "user", "content": text}])
+            messages=[{"role": "system", "content": _rewrite_prompt(bool(number_values(text)))},
+                      {"role": "user", "content": text}])
         emotion, marked = _parse_rewrite(_auxiliary_reply_text(response))
-        spoken = render_numbers(text, marked.replace("́", ""), detect_language(text) or "")
+        spoken = render_numbers(text, marked.replace("\u0301", ""), detect_language(text) or "")
     except Exception as exc:
         logger.warning("Voice rewrite failed; speaking the reply as written: %s", exc)
         return text, None

@@ -1,4 +1,6 @@
-"""Stress marks on Russian homographs (за\u0301мок / замо\u0301к), chosen from the sentence by ruaccent.
+"""Stress marks on Russian homographs (за\u0301мок / замо\u0301к), chosen by ruaccent from the ten words
+on each side of it: on real replies that reads more homographs right than the whole reply or
+its sentence.
 
 Only the homograph model and its word list are loaded (about 0.5 GB of memory), not ruaccent's
 full stress dictionary (about 2 GB): the voice already stresses ordinary words right, it is the
@@ -23,6 +25,7 @@ MODEL = "nn/nn_omograph/turbo3.1"
 MODEL_FILES = ("model.onnx", "config.json", "tokenizer.json", "tokenizer_config.json",
                "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt")
 HOMOGRAPHS = "dictionary/omographs.json.gz"
+CONTEXT_WORDS = 10
 
 _TOKEN_RE = re.compile(r"[а-яё]+(?:-[а-яё]+)*|[^а-яё\s]+", re.IGNORECASE)
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+(?=[,.?!:;…])")
@@ -82,7 +85,7 @@ def _marked(variant: str, word: str) -> str:
 
 
 def stress_homographs(text: str) -> str:
-    """``text`` with a stress mark on each Russian homograph, chosen from its sentence. Earlier
+    """``text`` with a stress mark on each Russian homograph, chosen from the words around it. Earlier
     stress marks are dropped first: a guessed stress on an ordinary word is often wrong."""
     text = text.replace(STRESS, "")
     engine = _load()
@@ -98,6 +101,7 @@ def stress_homographs(text: str) -> str:
     for i, variants in found:
         context = words.copy()
         context[i] = f" <w>{context[i]}</w> "
+        context = context[max(0, i - CONTEXT_WORDS):i + CONTEXT_WORDS + 1]
         batch += [_SPACE_BEFORE_PUNCT_RE.sub("", " ".join(context))] * len(variants)
         hypotheses += variants
         counts.append(len(variants))

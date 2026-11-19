@@ -131,3 +131,18 @@ def test_the_spoken_reply_note_asks_for_marks_only_for_a_2_8_voice():
     assert "[[emotion]]" in note and "(sighs)" in note and "as words" in note
     with patch("tools.tts_tool._load_tts_config", return_value=_config("speech-02-hd")):
         assert spoken_reply_note() is None
+
+
+def test_a_homograph_is_judged_by_the_words_around_it_not_the_whole_reply():
+    seen = []
+
+    class _Model:
+        def classify(self, texts, hypotheses, counts):
+            seen.extend(texts)
+            return ["зам+ок"]
+
+    far = "Утром мы долго гуляли по парку у реки и кормили уток, потом пили чай. "
+    with patch("tools.tts_ru_stress._load", return_value=(_Model(), {"замок": ["з+амок", "зам+ок"]})):
+        spoken = tts_ru_stress.stress_homographs(far + "На двери висит новый замок.")
+    assert spoken.endswith("висит новый замо́к.")
+    assert "утром" not in seen[0] and "висит новый" in seen[0] and "<w>замок</w>" in seen[0]

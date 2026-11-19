@@ -392,7 +392,9 @@ def _raise_minimax_api_error(result: dict[str, Any]) -> None:
 
 def _generate_minimax_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """Generate audio via MiniMax: ``t2a_v2`` (nested payload, JSON reply with hex audio) or the legacy
-    ``text_to_speech`` endpoint (flat payload, raw ``audio/*`` body), detected from the URL."""
+    ``text_to_speech`` endpoint (flat payload, raw ``audio/*`` body), detected from the URL. Without an
+    ``emotion`` (configured or chosen by the model) the request names none and MiniMax picks one
+    from the text."""
     runtime = _resolve_minimax_tts_runtime(tts_config)
     mm_config = _section(tts_config, "minimax")
     model = mm_config.get("model", DEFAULT_MINIMAX_MODEL)
@@ -425,7 +427,7 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: dict[str, Any
             "model": model, "text": text,
             "voice_setting": {
                 "voice_id": voice_id, "speed": mm_config.get("speed", 1.0), "vol": mm_config.get("vol", 1.0),
-                "pitch": mm_config.get("pitch", 0), "emotion": mm_config.get("emotion", "neutral"),
+                "pitch": mm_config.get("pitch", 0),
             },
             "audio_setting": {
                 "sample_rate": mm_config.get("sample_rate", 32000), "bitrate": mm_config.get("bitrate", 128000),
@@ -434,6 +436,8 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: dict[str, Any
         }
         if language_boost:
             payload["language_boost"] = language_boost
+        if mm_config.get("emotion"):
+            payload["voice_setting"]["emotion"] = mm_config["emotion"]
     else:
         payload = {"model": model, "text": text, "voice_id": voice_id}
     response = _post_json(base_url, payload, {

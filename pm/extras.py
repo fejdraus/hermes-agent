@@ -27,7 +27,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "mistral": "mistralai",
     "edge-tts": "edge_tts",
     "lang-detect": "lingua",
-    "ru-voice": ("num2words", "ruaccent"),
+    "ru-voice": "ruaccent",
     "neutts": "neutts",
     "kittentts": ("kittentts", "soundfile"),
     "piper": "piper",

@@ -552,6 +552,7 @@ def text_to_speech_tool(
         return error
     tts_config = _apply_language_voice(tts_config, provider, text, language)
     tts_config = apply_emotion(tts_config, provider, emotion)
+    text = apply_stress(text, tts_config, provider, language)
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
     chunks = _split_text_for_tts(text, max_len)
@@ -704,7 +705,7 @@ def check_tts_requirements() -> bool:
 
 # --- Registry ---
 from tools.registry import registry, tool_error
-from tools.tts_minimax_expression import EMOTION_SCHEMA, TEXT_GUIDANCE, apply_emotion, is_expressive
+from tools.tts_minimax_expression import EMOTION_SCHEMA, TEXT_GUIDANCE, apply_emotion, apply_stress, is_expressive
 
 def _output_path_description(home: str) -> str:
     return f"Optional custom file path to save the audio. Defaults to {home}/audio_cache/<timestamp>.mp3"

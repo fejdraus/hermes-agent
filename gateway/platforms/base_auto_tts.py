@@ -26,9 +26,16 @@ def _profile_scope(adapter, source) -> contextlib.AbstractAsyncContextManager:
 
 
 def _synthesize(text: str, output_path: str) -> list[str]:
-    """Worker-thread half: run the TTS tool and keep the files it reports that exist."""
-    from tools.tts_tool import text_to_speech_tool
-    tts_data = json.loads(text_to_speech_tool(text=text, output_path=output_path))
+    """Worker-thread half: run the TTS tool and keep the files it reports that exist. A MiniMax 2.8
+    voice first gets the reply rewritten for speech (emotion, sound tags, stress, numbers)."""
+    from tools.tts_minimax_expression import is_expressive, rewrite_for_voice
+    from tools.tts_tool import _get_provider, _load_tts_config, text_to_speech_tool
+    tts_config = _load_tts_config()
+    emotion = None
+    if is_expressive(tts_config, _get_provider(tts_config)):
+        text, emotion = rewrite_for_voice(text)
+    extra = {"emotion": emotion} if emotion else {}
+    tts_data = json.loads(text_to_speech_tool(text=text, output_path=output_path, **extra))
     if not tts_data.get("success", True):
         return []
     raw_tts_paths = tts_data.get("file_paths") or [tts_data.get("file_path")]

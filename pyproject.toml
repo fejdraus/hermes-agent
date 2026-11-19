@@ -246,6 +246,7 @@ fal = ["fal-client==0.14.1"]
 # ElevenLabs / OpenAI / MiniMax instead).
 edge-tts = ["edge-tts==7.3.1"]
 lang-detect = ["lingua-language-detector==2.2.0; sys_platform != 'android'"]
+ru-voice = ["num2words==0.5.14; sys_platform != 'android'", "ruaccent==1.5.8.3; sys_platform != 'android'"]
 # NeuTTS's upstream Python ceiling excludes the managed interpreter.
 # Keep dependency markers and PM gates together: bundles omit them, explicit
 # setup requests report unavailable rather than succeeding with an empty set.

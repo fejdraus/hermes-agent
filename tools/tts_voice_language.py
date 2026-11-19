@@ -43,6 +43,8 @@ def _detector():
 
 
 def detect_language(text: str) -> Optional[str]:
+    from tools.tts_minimax_expression import strip_sound_tags
+    text = strip_sound_tags(text)
     try:
         detector = _detector()
     except ImportError:

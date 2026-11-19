@@ -528,7 +528,7 @@ def text_to_speech_tool(
     text: str, output_path: Optional[str] = None, speed: Optional[float] = None,
     instructions: Optional[str] = None, provider: Optional[str] = None,
     voice_id: Optional[str] = None, find_voices: Optional[dict[str, Any]] = None,
-    language: Optional[str] = None) -> str:
+    language: Optional[str] = None, emotion: Optional[str] = None) -> str:
     """Convert text to speech with long-form chunking; returns the JSON result envelope.
 
     Text is normalized, split into provider-safe chunks (never silently truncated), synthesized
@@ -551,6 +551,7 @@ def text_to_speech_tool(
     if error:
         return error
     tts_config = _apply_language_voice(tts_config, provider, text, language)
+    tts_config = apply_emotion(tts_config, provider, emotion)
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
     chunks = _split_text_for_tts(text, max_len)
@@ -703,6 +704,7 @@ def check_tts_requirements() -> bool:
 
 # --- Registry ---
 from tools.registry import registry, tool_error
+from tools.tts_minimax_expression import EMOTION_SCHEMA, TEXT_GUIDANCE, apply_emotion, is_expressive
 
 def _output_path_description(home: str) -> str:
     return f"Optional custom file path to save the audio. Defaults to {home}/audio_cache/<timestamp>.mp3"
@@ -714,7 +716,11 @@ def _tts_schema_overrides() -> dict:
     would name the launch profile's home for everyone else (#95685)."""
     params = copy.deepcopy(TTS_SCHEMA["parameters"])
     params["properties"]["output_path"]["description"] = _output_path_description(display_hermes_home())
-    languages = minimax_voice_languages()
+    tts_config = _load_tts_config()
+    if is_expressive(tts_config, _get_provider(tts_config)):
+        params["properties"]["emotion"] = copy.deepcopy(EMOTION_SCHEMA)
+        params["properties"]["text"]["description"] += TEXT_GUIDANCE
+    languages = minimax_voice_languages(tts_config)
     if languages:
         params["properties"]["language"] = {
             "type": "string", "enum": languages,
@@ -750,7 +756,7 @@ def _model_text_to_speech(args: dict[str, Any], **_kw: Any) -> str:
             success=False)
     return text_to_speech_tool(
         text=text,
-        **{k: args.get(k) for k in ("output_path", "speed", "instructions", "voice_id", "find_voices", "language")})
+        **{k: args.get(k) for k in ("output_path", "speed", "instructions", "voice_id", "find_voices", "language", "emotion")})
 
 
 TTS_SCHEMA = {

@@ -67,7 +67,7 @@ def strip_sound_tags(text: str) -> str:
 
 
 def apply_stress(text: str, tts_config: dict[str, Any], provider: str, language: Optional[str]) -> str:
-    """Russian text for a 2.8 voice gets ruaccent's stress marks on its homographs."""
+    """Russian text for a 2.8 voice gets its ё back and ruaccent's stress marks on its homographs."""
     if not is_expressive(tts_config, provider):
         return text
     language = (language or "").strip().lower()
@@ -76,8 +76,17 @@ def apply_stress(text: str, tts_config: dict[str, Any], provider: str, language:
         language = detect_language(text)
     if language != "ru":
         return text
-    from tools.tts_ru_stress import stress_homographs
-    return stress_homographs(text)
+    from tools.tts_ru_stress import prepare_russian
+    return prepare_russian(text)
+
+
+def warm_up_voice_models() -> None:
+    """At gateway start, load the Russian stress model in the background when the voice is 2.8."""
+    from tools.tts_tool import _get_provider, _load_tts_config
+    tts_config = _load_tts_config()
+    if is_expressive(tts_config, _get_provider(tts_config)):
+        from tools.tts_ru_stress import warm_up
+        warm_up()
 
 
 REWRITE_TASK = "tts_audio_tags"

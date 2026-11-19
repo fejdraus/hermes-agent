@@ -28,7 +28,7 @@ def _speak(tmp_path, config, text, **kwargs):
 
     with patch("tools.tts_tool._generate_minimax_tts", side_effect=_fake_minimax), \
          patch("tools.tts_tool._load_tts_config", return_value=config), \
-         patch("tools.tts_ru_stress.stress_homographs", side_effect=lambda t: t.replace("замке", "за\u0301мке")):
+         patch("tools.tts_ru_stress.prepare_russian", side_effect=lambda t: t.replace("замке", "за\u0301мке")):
         result = json.loads(tts_tool.text_to_speech_tool(text, output_path=str(tmp_path / "a.mp3"), **kwargs))
     assert result["success"]
     return seen
@@ -79,10 +79,27 @@ def test_homograph_stress_follows_the_chosen_reading_and_replaces_guessed_marks(
             assert "<w>замке</w>" in texts[0] and "<w>замка</w>" in texts[-1]
             return ["з+амке", "замк+а"]
 
-    engine = (_Model(), {"замке": ["з+амке", "замк+е"], "замка": ["з+амка", "замк+а"]})
+    engine = tts_ru_stress._Engine(_Model(), {"замке": ["з+амке", "замк+е"], "замка": ["з+амка", "замк+а"]},
+                                   {"еще": "ещё", "черный": "чёрный"})
     with patch("tools.tts_ru_stress._load", return_value=engine):
-        spoken = tts_ru_stress.stress_homographs("В Замке ключ от за\u0301мка, кури\u0301ца.")
-    assert spoken == "В За\u0301мке ключ от замка\u0301, курица."
+        spoken = tts_ru_stress.prepare_russian("В Замке еще ключ от за́мка, Черный кот, кури́ца.")
+    assert spoken == "В За́мке ещё ключ от замка́, Чёрный кот, курица."
+
+
+def test_a_homograph_is_judged_by_the_words_around_it_not_the_whole_reply():
+    seen = []
+
+    class _Model:
+        def classify(self, texts, hypotheses, counts):
+            seen.extend(texts)
+            return ["зам+ок"]
+
+    engine = tts_ru_stress._Engine(_Model(), {"замок": ["з+амок", "зам+ок"]}, {})
+    far = "Утром мы долго гуляли по парку у реки и кормили уток, потом пили чай. "
+    with patch("tools.tts_ru_stress._load", return_value=engine):
+        spoken = tts_ru_stress.prepare_russian(far + "На двери висит новый замок.")
+    assert spoken.endswith("висит новый замо́к.")
+    assert "утром" not in seen[0] and "висит новый" in seen[0] and "<w>замок</w>" in seen[0]
 
 
 def _auto_voice(model, reply_text, rewritten, prompts=None):

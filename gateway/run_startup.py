@@ -188,6 +188,10 @@ class GatewayStartupMixin:
         """Kick off the boot turn-machinery warm-up so it overlaps the network-bound platform
         connects; ``_finish_startup_restore`` awaits it (bounded)."""
         from gateway.run import _startup_warmup_timeout_secs
+        with _log_suppressed(logging.WARNING, "Voice model warm-up failed; the first voice reply loads it",
+                             exc_info=True):
+            from tools.tts_minimax_expression import warm_up_voice_models
+            warm_up_voice_models()
         if _startup_warmup_timeout_secs() <= 0:
             self._startup_warmup_task = None
             return

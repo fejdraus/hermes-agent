@@ -65,6 +65,7 @@ from hermes_cli.plugins_state import (
 )
 # PluginContext lives in plugins_context.py; this facade stays its public import path.
 from hermes_cli.plugins_context import PluginContext, _UNSET, _ignore_after_abandoned_load
+from hermes_cli._startup_fast import project_root_str
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -73,7 +74,7 @@ def get_bundled_plugins_dir() -> Path:
     env_override = os.getenv("HERMES_BUNDLED_PLUGINS")
     if env_override:
         return Path(env_override)
-    return Path(__file__).resolve().parent.parent / "plugins"
+    return Path(project_root_str()) / "plugins"
 
 
 class PluginToolOverrideError(PermissionError):
@@ -150,6 +151,11 @@ VALID_HOOKS: set[str] = {
     # pattern_keys, session_key, surface ("cli"|"gateway"|"smart"|"mcp-elicitation/<server>"|"mcp-trust/<server>"|
     # "vault-payment"); post_approval_response adds choice/decided_by. on_human_input_*: tools/human_input_hooks.py.
     "pre_approval_request", "post_approval_response", "on_human_input_request", "on_human_input_resolved",
+    # on_session_prompt*: a gateway session owner opened / closed a prompt a person answers for its viewers
+    # (approval, clarify, sudo, secret, vault.*), with the prompt_id that answers it; observer, off-thread,
+    # in the owning profile. Kwargs: session_id, kind, prompt_id, execution_generation, then params
+    # (force-redacted) or reason. gateway/session_prompt_hooks.py.
+    "on_session_prompt", "on_session_prompt_settled",
     # on_room_member_activity: a hosted Group Chat member's live runtime events (tool.started/completed,
     # request.opened, message.delta, reasoning.delta, turn.error, ...) stamped with room_id, thread_id,
     # member_id, turn_id, task_id, execution_generation. Observer, queued per consumer off the token
@@ -265,13 +271,16 @@ def _resolve_hook_callback_timeout() -> float:
 class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     """Central manager that discovers, loads, and invokes plugins."""
 
-    def __init__(self, scope_key: Optional[str] = None) -> None:
+    def __init__(self, scope_key: Optional[str] = None, owner_home: Optional[Path] = None) -> None:
         # Capture the home immutably. Unload can run from a different ambient
         # profile context, but every inverse must target the registration's
         # original scope.  Normalize through hermes_home_key so the scope
         # matches the key the registries store under (normcase on Windows).
         self.scope_key = hermes_home_key(scope_key)
         self.home_path = Path(self.scope_key)
+        # The home as the profile was named, before resolving: a marked profile whose directory is a link
+        # out of the Hermes root is found by that name only (``plugin_isolation.host_launcher``).
+        self.owner_home = Path(owner_home) if owner_home is not None else self.home_path
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
@@ -435,6 +444,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                     # Re-register so force-reload is symmetric (#60036; tracking #64178 — salvaged from PR
                     # #64188; outbound webhooks added per #92682 review).
                     self._re_register_config_hooks_after_force()
+                    # Model providers load through providers/ discovery, which this sweep skips: re-scan
+                    # this home's provider plugins too, so an updated one reloads now (#153300). A
+                    # process that never imported providers has nothing stale to reload.
+                    if (providers := sys.modules.get("providers")) is not None:
+                        providers.refresh_bound_home()
             except BaseException:
                 self._discovered = False
                 raise
@@ -832,7 +846,7 @@ def get_plugin_manager() -> PluginManager:
         else:
             manager = _plugin_managers_by_home.get(current_home)
             if manager is None:
-                manager = PluginManager(scope_key=hermes_home_key(current_home))
+                manager = PluginManager(scope_key=hermes_home_key(current_home), owner_home=get_hermes_home())
                 _plugin_managers_by_home[current_home] = manager
             _plugin_manager = manager
     _attach_published_gateway_host(manager)

@@ -35,7 +35,6 @@ from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
-from gateway.session_context import scoped_turn_actor
 from gateway.session_transcript import TranscriptReadError
 from gateway.run_turn_bubble_cleanup import register_bubble_cleanup, settle_turn_senders
 from gateway.turn_context import TurnContext
@@ -953,7 +952,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _voice_ack_guild: list[Optional[int]] = [self._voice_ack_guild_for(source)]
 
         # Auto-cleanup of temporary progress bubbles needs a real ``delete_message`` (getattr on the
-        # type: a fake adapter without it means "can't delete", not a crash).
+        # adapter type, so a fake adapter without it means "can't delete", not a crash).
         _cleanup_progress = bool(
             disp.resolve_display_setting(disp.user_config, disp.platform_key, "cleanup_progress")
         )
@@ -1173,23 +1172,13 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _interrupt_detected: asyncio.Event, streaming_tts_consumer_holder: list, *,
         log_context: str, log: Callable[[], None],
     ) -> None:
-        """Peek the adapter's pending event, transcribe voice, then signal the agent + abort streaming TTS.
+        """Peek the adapter's pending event, then signal the agent + abort streaming TTS.
 
         Peek WITHOUT consuming: the event must stay for the post-run ``_dequeue_pending_event()``
-        (popping races the agent finishing). Transcribe BEFORE signaling so voice interrupts carry
-        the real transcript."""
-        from gateway.run import _build_media_placeholder
+        (popping races the agent finishing), which also transcribes a voice note, so the signal
+        never waits for STT (#143961)."""
         _peek_event = adapter._pending_messages.get(session_key)
-        pending_text = None
-        if _peek_event is not None:
-            pending_text = _peek_event.text or ""
-            if self._pending_event_audio_paths(_peek_event):
-                pending_text, _ = await self._transcribe_and_echo_pending_voice(
-                    _peek_event, adapter, source, pending_text, log_context=log_context,
-                    metadata={"thread_id": source.thread_id} if source.thread_id else None,
-                )
-            elif not pending_text and (getattr(_peek_event, "media_urls", None) or []):
-                pending_text = _build_media_placeholder(_peek_event)
+        pending_text = None if _peek_event is None else (self._busy_interrupt_text(_peek_event) or "")
         log()
         agent.interrupt(pending_text)
         _interrupt_detected.set()
@@ -1779,7 +1768,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
             # The follow-up is its own sender's turn: approvals it raises name that sender, not the opener.
-            with scoped_turn_actor(pending_event, self._session_state(session_key).turn) if pending_event is not None else nullcontext():
+            with self._follow_up_turn_scope(session_key, source, pending_event, pending):
                 followup_result = await self._run_agent(
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                     source=next_source, session_id=session_id, session_key=next_session_key,

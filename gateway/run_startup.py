@@ -29,10 +29,12 @@ from gateway.restart import (
 from gateway.run_shutdown import _log_suppressed, _send_error
 from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
 from gateway.shutdown_watchdog import (
-    DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
-    DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
+    DEFAULT_HEARTBEAT_INTERVAL_S, loop_heartbeat_forever,
 )
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+
+if TYPE_CHECKING:
+    from gateway.status_report.reporter import StatusReporter
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -710,36 +712,8 @@ class GatewayStartupMixin:
         return True
 
     def _start_loop_liveness_guards(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Arm the selector floor and out-of-loop watchdog before adapters. Disabled entirely with
-        ``gateway.loop_watchdog: false`` in config.yaml (config-only knob).
-
-        See #69089.
-        """
-        from gateway.shutdown_watchdog import _arm_loop_floor_timer, start_loop_liveness_watchdog
-        config = getattr(self, "config", None)
-        if config is not None and not getattr(config, "loop_watchdog", True):
-            return
-        if getattr(self, "_loop_floor_timer_handle", None) is None:
-            with _log_suppressed(logging.DEBUG, "Failed to arm gateway loop floor timer", exc_info=True):
-                self._loop_floor_timer_handle = _arm_loop_floor_timer(loop)
-        watchdog = getattr(self, "_loop_liveness_watchdog", None)
-        if watchdog is None or not watchdog.is_alive():
-            try:
-                # getattr defaults cover config=None test paths; loaded values are already clamped.
-                self._loop_liveness_watchdog = start_loop_liveness_watchdog(
-                    loop,
-                    probe_interval=float(getattr(
-                        config, "loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S
-                    )),
-                    probe_timeout=float(getattr(
-                        config, "loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
-                    )),
-                    max_strikes=int(getattr(
-                        config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
-                    )),
-                )
-            except Exception:
-                logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+        from gateway.run_startup_liveness import start_loop_liveness_guards
+        start_loop_liveness_guards(self, loop)
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
@@ -1651,6 +1625,8 @@ class GatewayStartupMixin:
         "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
         "_delegation_auto_resume_watcher")
 
+    _status_reporter: Optional[StatusReporter] = None
+
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
         for method in self._PRE_RECONNECT_WATCHERS:
@@ -1680,9 +1656,30 @@ class GatewayStartupMixin:
                 self._log_scale_to_zero_not_armed_reason()
         except Exception:
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
+        self._start_status_report_watcher()
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
         # marker (prior-instantiation markers are ignored via epoch).
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
+
+    def _start_status_report_watcher(self) -> None:
+        """Only when the launch environment carries the stamp; ``reporter`` is imported only then."""
+        from gateway.status_report.target import STATUS_REPORT_URL_ENV
+        if not os.environ.get(STATUS_REPORT_URL_ENV, "").strip():
+            return
+        from gateway.status_report.reporter import INTERVAL_S, status_reporter_from_launch_env
+        reporter = self._status_reporter = status_reporter_from_launch_env()
+        if reporter is not None:
+            logger.info("status report: on, reporting gateway status about every %.0fs", INTERVAL_S)
+            self._spawn_supervised(lambda: reporter.run(lambda: self._running), "status_report_watcher")
+
+    async def _suspend_after_status_goodbye(self, lever, *args) -> bool:
+        reporter = self._status_reporter
+        if reporter is not None:
+            try:
+                reporter.goodbye()
+            except Exception:
+                logger.debug("status report: goodbye not started", exc_info=True)
+        return await asyncio.to_thread(lever, *args)
 
     @staticmethod
     async def _start_flush_runtime_status() -> None:
@@ -1911,8 +1908,11 @@ class GatewayStartupMixin:
                         handoff_profile = resolved
             except Exception:
                 logger.debug("Handoff: could not resolve profile namespace", exc_info=True)
+        from gateway.session_dm_threads import dm_thread_key_source, session_db_for_source
+        store = getattr(self.async_session_store, "_store", self.async_session_store)
         return build_session_key(
-            dest.source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            dm_thread_key_source(dest.source, extra, lambda: session_db_for_source(store, dest.source)),
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
 

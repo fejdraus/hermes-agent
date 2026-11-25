@@ -29,7 +29,7 @@ class _Adapter:
     async def _extract_response_content(self, text, event, session_key, *, is_ephemeral_response):
         return _ExtractedResponse(text, [], [], [], False, text)
 
-    async def _synthesize_auto_tts(self, text):
+    async def _synthesize_auto_tts(self, text, source=None):
         path = self.tmp_path / "reply.ogg"
         path.write_bytes(b"ogg")
         return [str(path)], str(path)

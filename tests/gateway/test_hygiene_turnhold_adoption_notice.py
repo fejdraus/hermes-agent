@@ -33,7 +33,7 @@ def test_adoption_notice_is_translated_not_english_fallback():
 
 
 def test_notice_is_sent_only_on_the_committed_branch():
-    source = (ROOT / "gateway" / "run_turn.py").read_text(encoding="utf-8")
+    source = (ROOT / "gateway" / "run_turn_hygiene.py").read_text(encoding="utf-8")
     assert source.count('t("gateway.compress.turnhold_adopted")') == 1
     callback = source[source.index("def _hyg_adopt_or_space_retry"):]
     callback = callback[:callback.index("attempt.future.add_done_callback")]
